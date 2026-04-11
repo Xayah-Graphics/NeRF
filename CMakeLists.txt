@@ -2,6 +2,7 @@ cmake_minimum_required(VERSION 4.3.0)
 set(CMAKE_EXPERIMENTAL_CXX_IMPORT_STD "451f2fe2-a8a2-47c3-bc32-94786d8fc91b")
 project(NeRF VERSION 1.0.0 LANGUAGES CXX CUDA)
 
+option(NERF_BUILD_BENCHMARK "Build benchmark applications" OFF)
 
 # ============================================================================
 # C++ Configuration
@@ -27,7 +28,7 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 # ============================================================================
 # Dependencies
 # ============================================================================
-find_package(CUDAToolkit REQUIRED)
+find_package(CUDAToolkit 13.2 REQUIRED)
 
 function(download_if_needed url out_path)
     if (EXISTS "${out_path}")
@@ -79,11 +80,14 @@ target_sources(
         nerf.h
 )
 target_link_libraries(nerf PUBLIC CUDA::cudart CUDA::cuda_driver CUDA::cublas)
+target_compile_definitions(nerf PRIVATE NOMINMAX NERF_BUILD_SHARED NERF_BUILD_EXPORTS)
 target_include_directories(nerf PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_include_directories(nerf PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/vendor")
 
 # ============================================================================
 # Benchmark
 # ============================================================================
-add_executable(benchmark benchmark.cu)
-target_link_libraries(benchmark PRIVATE nerf)
+if (NERF_BUILD_BENCHMARK)
+    add_executable(benchmark benchmark.cu)
+    target_link_libraries(benchmark PRIVATE nerf)
+endif ()
