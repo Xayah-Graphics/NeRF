@@ -1,0 +1,8 @@
+.idea
+.venv
+.clang-format
+cmake-build-*
+build-*
+build*
+data/
+AGENTS.md
