@@ -25,6 +25,57 @@
 extern "C" {
 #endif
 
+#define NERF_MAX_SAMPLE_STEPS_PER_RAY               256
+#define NERF_CONST_POS_FREQS                        10
+#define NERF_CONST_DIR_FREQS                        4
+#define NERF_CONST_PTS_IN_DIM                       63
+#define NERF_CONST_DIR_IN_DIM                       27
+#define NERF_CONST_TRAIN_CHUNK_ROWS                 65536
+#define NERF_CONST_SAMPLER_BLOCK_RAYS               128
+#define NERF_CONST_SAMPLER_MAX_SAMPLE_STEPS_PER_RAY 256
+#define NERF_CONST_DENSITY_INPUT_DIM                64
+#define NERF_CONST_DENSITY_OUTPUT_DIM               16
+#define NERF_CONST_DENSITY_WIDTH                    128
+#define NERF_CONST_DENSITY_HIDDEN_LAYERS            5
+#define NERF_CONST_GEO_FEATURE_DIM                  15
+#define NERF_CONST_COLOR_INPUT_DIM                  48
+#define NERF_CONST_COLOR_OUTPUT_DIM                 3
+#define NERF_CONST_COLOR_OUTPUT_PADDED_DIM          16
+#define NERF_CONST_COLOR_WIDTH                      128
+#define NERF_CONST_COLOR_HIDDEN_LAYERS              3
+#define NERF_CONST_NETWORK_BATCH_GRANULARITY        256
+#define NERF_CONST_NETWORK_CHECKPOINT_MAX_TENSORS   32
+#define NERF_CONST_FUSED_WIDTH                      128
+#define NERF_CONST_FUSED_OUTPUT_WIDTH               16
+#define NERF_CONST_FUSED_SKEW                       8
+#define NERF_CONST_FUSED_INPUT_SKEW                 8
+#define NERF_CONST_FUSED_BLOCK_ROWS                 8
+#define NERF_CONST_FUSED_ITERS                      8
+#define NERF_CONST_FUSED_BATCH_QUANTUM              128
+#define NERF_CONST_FUSED_FORWARD_SHMEM_DENSITY      39168
+#define NERF_CONST_FUSED_FORWARD_SHMEM_COLOR        39168
+#define NERF_CONST_FUSED_BACKWARD_SHMEM             34816
+#define NERF_CONST_FUSED_ELEMS_PER_LOAD             2048
+#define NERF_CONST_FUSED_WEIGHTS_STRIDE             16384
+#define NERF_CONST_WMMA_THREADS_X                   32
+#define NERF_CONST_WMMA_THREADS_Y                   8
+#define NERF_CONST_WMMA_THREADS_Z                   1
+#define NERF_CONST_INPUT_GRAD_THREADS_X             16
+#define NERF_CONST_INPUT_GRAD_THREADS_Y             16
+#define NERF_CONST_INPUT_GRAD_THREADS_Z             1
+#define NERF_CONST_THREADS_256                      256
+#define NERF_CONST_ARENA_ALIGN_BYTES                16
+#define NERF_CONST_OCCUPANCY_BLOCK_X                256
+#define NERF_CONST_CONVERT_THREADS                  256
+#define NERF_CONST_NETWORK_LOSS_SCALE               128.0f
+#define NERF_CONST_SAMPLER_EPS                      1e-8f
+#define NERF_CONST_INV255                           (1.0f / 255.0f)
+#define NERF_CONST_BLAS_ALPHA                       1.0f
+#define NERF_CONST_BLAS_BETA                        0.0f
+#define NERF_CONST_GLOBAL_GRAD_CLIP_NORM            1.0f
+#define NERF_CONST_UPDATE_GUARD_GRAD_NORM           100.0f
+#define NERF_CONST_INV_LOSS_SCALE                   (1.0f / NERF_CONST_NETWORK_LOSS_SCALE)
+
 typedef enum NerfStatus {
     NERF_STATUS_OK                            = 0,
     NERF_STATUS_INVALID_ARGUMENT              = 1,
@@ -118,8 +169,6 @@ typedef struct NerfTrainingConfig {
     uint32_t fixed_train_camera_idx;
 } NerfTrainingConfig;
 NERF_API NerfStatus nerf_configure_training(void* context, const NerfTrainingConfig* config);
-
-typedef enum NerfLimits { NERF_MAX_SAMPLE_STEPS_PER_RAY = 256 } NerfLimits;
 
 typedef struct NerfStepRequest {
     uint32_t rays_per_batch;
