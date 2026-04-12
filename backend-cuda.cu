@@ -56,9 +56,9 @@ constexpr std::uint32_t kFusedInputSkew         = 8u;
 constexpr std::uint32_t kFusedBlockRows         = kFusedWidth / 16u;
 constexpr std::uint32_t kFusedIters             = 8u;
 constexpr std::uint32_t kFusedBatchQuantum      = 16u * kFusedIters;
-constexpr std::size_t kFusedForwardShmemDensity = std::max(static_cast<std::size_t>(sizeof(__half)) * (kFusedWidth + 16u) * (kDensityInputDim + kFusedInputSkew), static_cast<std::size_t>(sizeof(__half)) * (16u + 16u * kFusedIters) * (kFusedWidth + kFusedSkew));
-constexpr std::size_t kFusedForwardShmemColor   = std::max(static_cast<std::size_t>(sizeof(__half)) * (kFusedWidth + 16u) * (kColorInputDim + kFusedInputSkew), static_cast<std::size_t>(sizeof(__half)) * (16u + 16u * kFusedIters) * (kFusedWidth + kFusedSkew));
-constexpr std::size_t kFusedBackwardShmem       = static_cast<std::size_t>(sizeof(__half)) * 16u * kFusedIters * (kFusedWidth + kFusedSkew);
+constexpr std::size_t kFusedForwardShmemDensity = std::max(sizeof(__half) * (kFusedWidth + 16u) * (kDensityInputDim + kFusedInputSkew), sizeof(__half) * (16u + 16u * kFusedIters) * (kFusedWidth + kFusedSkew));
+constexpr std::size_t kFusedForwardShmemColor   = std::max(sizeof(__half) * (kFusedWidth + 16u) * (kColorInputDim + kFusedInputSkew), sizeof(__half) * (16u + 16u * kFusedIters) * (kFusedWidth + kFusedSkew));
+constexpr std::size_t kFusedBackwardShmem       = sizeof(__half) * 16u * kFusedIters * (kFusedWidth + kFusedSkew);
 constexpr std::uint32_t kFusedElemsPerLoad      = kFusedBlockRows * 32u * 8u;
 constexpr std::uint32_t kFusedWeightsStride     = kFusedWidth * kFusedWidth;
 
@@ -280,7 +280,7 @@ namespace nerf::io {
                 case NERF_COORD_AXIS_NEGATIVE_Z: axis = 2u; break;
                 default: return NERF_STATUS_INVALID_ARGUMENT;
                 }
-                if ((seen_axes & (1u << axis)) != 0u) return NERF_STATUS_INVALID_ARGUMENT;
+                if ((seen_axes & 1u << axis) != 0u) return NERF_STATUS_INVALID_ARGUMENT;
                 seen_axes |= 1u << axis;
             }
             if (seen_axes != 0x7u) return NERF_STATUS_INVALID_ARGUMENT;
@@ -364,7 +364,7 @@ namespace nerf::io {
             return NERF_STATUS_IMAGE_LOAD_FAILED;
         }
 
-        const std::uint64_t image_count_u64 = static_cast<std::uint64_t>(frame_count);
+        const std::uint64_t image_count_u64 = frame_count;
         std::uint64_t image_bytes           = image_count_u64;
         if (image_bytes > std::numeric_limits<std::uint64_t>::max() / 4u) {
             stbi_image_free(first_pixels);
@@ -390,12 +390,12 @@ namespace nerf::io {
         const float cx                      = 0.5f * (width_f - 1.0f);
         const float cy                      = 0.5f * (height_f - 1.0f);
 
-        std::vector<std::uint8_t> host_images_rgba8(static_cast<std::size_t>(image_bytes));
-        std::memcpy(host_images_rgba8.data(), first_pixels, static_cast<std::size_t>(bytes_per_image));
+        std::vector<std::uint8_t> host_images_rgba8(image_bytes);
+        std::memcpy(host_images_rgba8.data(), first_pixels, bytes_per_image);
         stbi_image_free(first_pixels);
 
         std::atomic<std::size_t> next_image_index{1u};
-        std::atomic<int> decode_failure{static_cast<int>(NERF_STATUS_OK)};
+        std::atomic<int> decode_failure{NERF_STATUS_OK};
         std::size_t worker_count = 0u;
         if (frame_count > 1u) {
             const std::size_t hardware_threads = std::max<std::size_t>(1u, std::thread::hardware_concurrency());
@@ -414,7 +414,7 @@ namespace nerf::io {
 
                     std::error_code local_ec{};
                     if (!std::filesystem::is_regular_file(image_paths[image_index], local_ec) || local_ec) {
-                        decode_failure.store(static_cast<int>(NERF_STATUS_FILE_NOT_FOUND), std::memory_order_relaxed);
+                        decode_failure.store(NERF_STATUS_FILE_NOT_FOUND, std::memory_order_relaxed);
                         return;
                     }
 
@@ -423,16 +423,16 @@ namespace nerf::io {
                     int channels    = 0;
                     stbi_uc* pixels = stbi_load(image_paths[image_index].string().c_str(), &width, &height, &channels, 4);
                     if (!pixels) {
-                        decode_failure.store(static_cast<int>(NERF_STATUS_IMAGE_LOAD_FAILED), std::memory_order_relaxed);
+                        decode_failure.store(NERF_STATUS_IMAGE_LOAD_FAILED, std::memory_order_relaxed);
                         return;
                     }
                     if (width != first_width || height != first_height) {
                         stbi_image_free(pixels);
-                        decode_failure.store(static_cast<int>(NERF_STATUS_INCONSISTENT_IMAGE_RESOLUTION), std::memory_order_relaxed);
+                        decode_failure.store(NERF_STATUS_INCONSISTENT_IMAGE_RESOLUTION, std::memory_order_relaxed);
                         return;
                     }
 
-                    std::memcpy(host_images_rgba8.data() + static_cast<std::size_t>(image_index * bytes_per_image), pixels, static_cast<std::size_t>(bytes_per_image));
+                    std::memcpy(host_images_rgba8.data() + image_index * bytes_per_image, pixels, bytes_per_image);
                     stbi_image_free(pixels);
                 }
             });
@@ -651,7 +651,7 @@ namespace nerf::io {
                     .image_width   = static_cast<std::uint32_t>(first_width),
                     .image_height  = static_cast<std::uint32_t>(first_height),
                     .images_bytes  = image_bytes,
-                    .c2w_bytes     = static_cast<std::uint64_t>(out_data.c2w_4x4.size()) * sizeof(float),
+                    .c2w_bytes     = out_data.c2w_4x4.size() * sizeof(float),
                     .fx            = fx,
                     .fy            = fy,
                     .cx            = cx,
@@ -699,8 +699,8 @@ namespace nerf::io {
         }
         const std::string header_bytes = header.dump();
 
-        const std::uint64_t header_size = static_cast<std::uint64_t>(header_bytes.size());
-        file.write(reinterpret_cast<const char*>(&header_size), static_cast<std::streamsize>(sizeof(header_size)));
+        const std::uint64_t header_size = header_bytes.size();
+        file.write(reinterpret_cast<const char*>(&header_size), sizeof(header_size));
         file.write(header_bytes.data(), static_cast<std::streamsize>(header_bytes.size()));
         if (!file) return NERF_STATUS_INTERNAL_ERROR;
 
@@ -723,16 +723,16 @@ namespace nerf::io {
         if (!file) return NERF_STATUS_FILE_NOT_FOUND;
 
         file.seekg(0, std::ios::end);
-        const std::uint64_t file_size = static_cast<std::uint64_t>(file.tellg());
+        const std::uint64_t file_size = file.tellg();
         file.seekg(0, std::ios::beg);
         if (file_size < sizeof(std::uint64_t)) return NERF_STATUS_CHECKPOINT_INVALID;
 
         std::uint64_t header_size = 0u;
-        file.read(reinterpret_cast<char*>(&header_size), static_cast<std::streamsize>(sizeof(header_size)));
+        file.read(reinterpret_cast<char*>(&header_size), sizeof(header_size));
         if (!file) return NERF_STATUS_CHECKPOINT_INVALID;
         if (header_size == 0u || header_size > file_size - sizeof(std::uint64_t)) return NERF_STATUS_CHECKPOINT_INVALID;
 
-        std::string header_bytes(static_cast<std::size_t>(header_size), '\0');
+        std::string header_bytes(header_size, '\0');
         file.read(header_bytes.data(), static_cast<std::streamsize>(header_bytes.size()));
         if (!file) return NERF_STATUS_CHECKPOINT_INVALID;
 
@@ -791,8 +791,8 @@ namespace nerf::io {
         if (density_count != layout.density_param_count) return NERF_STATUS_CHECKPOINT_MISMATCH;
         if (color_count != layout.color_param_count) return NERF_STATUS_CHECKPOINT_MISMATCH;
 
-        data.density_params_f32.resize(static_cast<std::size_t>(density_count));
-        data.color_params_f32.resize(static_cast<std::size_t>(color_count));
+        data.density_params_f32.resize(density_count);
+        data.color_params_f32.resize(color_count);
         for (std::uint32_t index = 0u; index < layout.tensor_count; ++index) {
             const nerf::network::NetworkCheckpointTensorLayout& tensor_layout = layout.tensors[index];
             const nlohmann::json& tensor                                      = header[std::string{tensor_layout.name}];
@@ -889,7 +889,7 @@ namespace nerf::encoder {
         constexpr std::uint32_t threads = kThreads256;
         const std::uint32_t blocks      = (rows + threads - 1u) / threads;
         k_encode_sample_inputs<<<blocks, threads, 0, stream>>>(sample_inputs, rows, encoded_pts, encoded_dir);
-        return ((cudaGetLastError()) == cudaSuccess);
+        return cudaGetLastError() == cudaSuccess;
     }
 } // namespace nerf::encoder
 
@@ -911,8 +911,8 @@ namespace nerf::sampler {
         }
 
         __device__ __forceinline__ float cone_angle_from_focal(const float fx, const float fy) {
-            const float inv_fx = fx > 0.0f ? (1.0f / fx) : 0.0f;
-            const float inv_fy = fy > 0.0f ? (1.0f / fy) : 0.0f;
+            const float inv_fx = fx > 0.0f ? 1.0f / fx : 0.0f;
+            const float inv_fy = fy > 0.0f ? 1.0f / fy : 0.0f;
             return 0.5f * (inv_fx + inv_fy);
         }
 
@@ -931,7 +931,7 @@ namespace nerf::sampler {
             const std::uint32_t idx  = ix + iy * grid_res + iz * grid_res * grid_res;
             const std::uint32_t word = idx >> 5u;
             const std::uint32_t bit  = idx & 31u;
-            return (bitfield[word] & (1u << bit)) != 0u;
+            return (bitfield[word] & 1u << bit) != 0u;
         }
 
         struct CameraParams {
@@ -985,9 +985,9 @@ namespace nerf::sampler {
             constexpr float eps = kSamplerEps;
 
             float3 inv_dir{};
-            inv_dir.x = (fabsf(ray_dir.x) > eps) ? (1.0f / ray_dir.x) : (ray_dir.x >= 0.0f ? 1e8f : -1e8f);
-            inv_dir.y = (fabsf(ray_dir.y) > eps) ? (1.0f / ray_dir.y) : (ray_dir.y >= 0.0f ? 1e8f : -1e8f);
-            inv_dir.z = (fabsf(ray_dir.z) > eps) ? (1.0f / ray_dir.z) : (ray_dir.z >= 0.0f ? 1e8f : -1e8f);
+            inv_dir.x = fabsf(ray_dir.x) > eps ? 1.0f / ray_dir.x : ray_dir.x >= 0.0f ? 1e8f : -1e8f;
+            inv_dir.y = fabsf(ray_dir.y) > eps ? 1.0f / ray_dir.y : ray_dir.y >= 0.0f ? 1e8f : -1e8f;
+            inv_dir.z = fabsf(ray_dir.z) > eps ? 1.0f / ray_dir.z : ray_dir.z >= 0.0f ? 1e8f : -1e8f;
 
             const float3 t0    = make_float3((aabb_min.x - ray_origin.x) * inv_dir.x, (aabb_min.y - ray_origin.y) * inv_dir.y, (aabb_min.z - ray_origin.z) * inv_dir.z);
             const float3 t1    = make_float3((aabb_max.x - ray_origin.x) * inv_dir.x, (aabb_max.y - ray_origin.y) * inv_dir.y, (aabb_max.z - ray_origin.z) * inv_dir.z);
@@ -1027,7 +1027,7 @@ namespace nerf::sampler {
             }
             __syncthreads();
 
-            const std::uint32_t seed    = (frame_index * 1315423911u) ^ (ray_idx * 9781u);
+            const std::uint32_t seed    = frame_index * 1315423911u ^ ray_idx * 9781u;
             const float pixel_x         = rand01(seed ^ 0xA511E9B3u) * static_cast<float>(image_width);
             const float pixel_y         = rand01(seed ^ 0x63D83595u) * static_cast<float>(image_height);
             const float pixel_y_flipped = static_cast<float>(image_height) - 1.0f - pixel_y;
@@ -1151,7 +1151,7 @@ namespace nerf::sampler {
 
         const std::uint32_t blocks = (request.rays_per_batch + kSamplerBlockRays - 1u) / kSamplerBlockRays;
         k_sample_rays_flat<<<blocks, kSamplerBlockRays, 0, request.stream>>>(request.frame_index, request.camera_idx, request.cams, request.images, request.image_width, request.image_height, request.rays_per_batch, request.max_sample_steps_per_ray, request.max_sample_step_count, request.aabb_min, request.aabb_max, request.bitfield, request.occupancy_grid_res, request.sample_rays, request.sample_steps, request.batch_state);
-        return ((cudaGetLastError()) == cudaSuccess);
+        return cudaGetLastError() == cudaSuccess;
     }
 
 } // namespace nerf::sampler
@@ -1166,7 +1166,7 @@ namespace nerf::network {
 
             const std::uint32_t lane        = threadIdx.x;
             const std::uint32_t warp        = threadIdx.y;
-            const std::uint32_t lane_offset = (8u * lane) % kFusedWidth;
+            const std::uint32_t lane_offset = 8u * lane % kFusedWidth;
             const std::uint32_t row         = (8u * lane + warp * 8u * 32u) / kFusedWidth;
             const std::uint32_t weights_col = 16u * warp;
 
@@ -1214,7 +1214,7 @@ namespace nerf::network {
 
             const std::uint32_t lane        = threadIdx.x;
             const std::uint32_t warp        = threadIdx.y;
-            const std::uint32_t lane_offset = (8u * lane) % kFusedWidth;
+            const std::uint32_t lane_offset = 8u * lane % kFusedWidth;
             const std::uint32_t row         = (8u * lane + warp * 8u * 32u) / kFusedWidth;
             const std::uint32_t weights_col = 16u * warp;
             __half* const weights_shmem     = act_shmem + 16u * (input_width + kFusedInputSkew);
@@ -1277,7 +1277,7 @@ namespace nerf::network {
             const std::uint32_t lane        = threadIdx.x;
             const std::uint32_t warp        = threadIdx.y;
             __half* const weights_shmem     = act_shmem + kFusedIters * 16u * (kFusedWidth + kFusedSkew);
-            const std::uint32_t weights_row = (8u * lane) % kFusedWidth;
+            const std::uint32_t weights_row = 8u * lane % kFusedWidth;
             const std::uint32_t weights_col = (8u * lane + 8u * 32u * warp) / kFusedWidth;
 
             *reinterpret_cast<int4*>(&weights_shmem[weights_row + weights_col * (kFusedWidth + kFusedSkew)]) = *reinterpret_cast<const int4*>(&weights_this_layer[weights_row + weights_col * kFusedWidth]);
@@ -1307,7 +1307,7 @@ namespace nerf::network {
 
             const std::uint32_t lane        = threadIdx.x;
             const std::uint32_t warp        = threadIdx.y;
-            const std::uint32_t lane_offset = (8u * lane) % kFusedWidth;
+            const std::uint32_t lane_offset = 8u * lane % kFusedWidth;
             const std::uint32_t row         = (8u * lane + warp * 8u * 32u) / kFusedWidth;
             const std::uint32_t weights_col = 16u * warp;
 
@@ -1353,14 +1353,14 @@ namespace nerf::network {
             __half* const act_shmem      = shmem;
             const std::uint32_t elem_idx = 16u * blockIdx.x * kFusedIters;
 
-            fully_fused_input_forward(act_shmem, input + elem_idx * input_width, weights, out_intermediate ? (out_intermediate + elem_idx * kFusedWidth) : nullptr, input_width);
+            fully_fused_input_forward(act_shmem, input + elem_idx * input_width, weights, out_intermediate ? out_intermediate + elem_idx * kFusedWidth : nullptr, input_width);
 
             const std::uint32_t first_weights_stride = kFusedWidth * input_width;
             constexpr std::uint32_t weights_stride   = kFusedWeightsStride;
             const std::uint32_t layer_stride         = kFusedWidth * gridDim.x * kFusedBatchQuantum;
 
             for (std::uint32_t layer = 0u; layer < hidden_matmuls; ++layer) {
-                fully_fused_hidden_forward(act_shmem, weights + first_weights_stride + weights_stride * layer, out_intermediate ? (out_intermediate + layer_stride * (layer + 1u) + elem_idx * kFusedWidth) : nullptr);
+                fully_fused_hidden_forward(act_shmem, weights + first_weights_stride + weights_stride * layer, out_intermediate ? out_intermediate + layer_stride * (layer + 1u) + elem_idx * kFusedWidth : nullptr);
             }
 
             fully_fused_output_forward(act_shmem, weights + first_weights_stride + weights_stride * hidden_matmuls, output + elem_idx * kFusedOutputWidth);
@@ -1377,7 +1377,7 @@ namespace nerf::network {
 
             const std::uint32_t lane               = threadIdx.x;
             const std::uint32_t warp               = threadIdx.y;
-            const std::uint32_t lane_offset        = (8u * lane) % kFusedWidth;
+            const std::uint32_t lane_offset        = 8u * lane % kFusedWidth;
             const std::uint32_t row                = (8u * lane + warp * 8u * 32u) / kFusedWidth;
             const std::uint32_t weights_col        = 16u * warp;
             const std::uint32_t elem_idx_base      = 16u * blockIdx.x * kFusedIters;
@@ -1426,8 +1426,8 @@ namespace nerf::network {
         }
         if (handle == nullptr) return false;
         if (cublasSetStream(handle, stream) != CUBLAS_STATUS_SUCCESS) return false;
-        if (cudaFuncSetAttribute(k_fully_fused_forward, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(std::max(kFusedForwardShmemDensity, kFusedForwardShmemColor))) != cudaSuccess) return false;
-        if (cudaFuncSetAttribute(k_fully_fused_backward, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(kFusedBackwardShmem)) != cudaSuccess) return false;
+        if (cudaFuncSetAttribute(k_fully_fused_forward, cudaFuncAttributeMaxDynamicSharedMemorySize, std::max(kFusedForwardShmemDensity, kFusedForwardShmemColor)) != cudaSuccess) return false;
+        if (cudaFuncSetAttribute(k_fully_fused_backward, cudaFuncAttributeMaxDynamicSharedMemorySize, kFusedBackwardShmem) != cudaSuccess) return false;
         return true;
     }
 
@@ -1493,9 +1493,9 @@ namespace nerf::network {
 
         constexpr dim3 threads       = {kWmmaThreadsX, kWmmaThreadsY, kWmmaThreadsZ};
         const dim3 blocks            = {rows / kFusedBatchQuantum, 1u, 1u};
-        const std::size_t shmem_size = std::max(static_cast<std::size_t>(sizeof(__half)) * (kFusedWidth + 16u) * (network.input_width + kFusedInputSkew), static_cast<std::size_t>(sizeof(__half)) * (16u + 16u * kFusedIters) * (kFusedWidth + kFusedSkew));
+        const std::size_t shmem_size = std::max(sizeof(__half) * (kFusedWidth + 16u) * (network.input_width + kFusedInputSkew), sizeof(__half) * (16u + 16u * kFusedIters) * (kFusedWidth + kFusedSkew));
         k_fully_fused_forward<<<blocks, threads, shmem_size, stream>>>(input, network.params.ptr, nullptr, output, network.input_width, network.hidden_matmuls);
-        return ((cudaGetLastError()) == cudaSuccess);
+        return cudaGetLastError() == cudaSuccess;
     }
 
     static bool fully_fused_mlp_forward(const FusedNetworkState& network, cudaStream_t stream, const __half* input, std::uint32_t rows, __half* output, __half* forward_hidden) {
@@ -1504,10 +1504,10 @@ namespace nerf::network {
 
         constexpr dim3 threads       = {kWmmaThreadsX, kWmmaThreadsY, kWmmaThreadsZ};
         const dim3 blocks            = {rows / kFusedBatchQuantum, 1u, 1u};
-        const std::size_t shmem_size = std::max(static_cast<std::size_t>(sizeof(__half)) * (kFusedWidth + 16u) * (network.input_width + kFusedInputSkew), static_cast<std::size_t>(sizeof(__half)) * (16u + 16u * kFusedIters) * (kFusedWidth + kFusedSkew));
+        const std::size_t shmem_size = std::max(sizeof(__half) * (kFusedWidth + 16u) * (network.input_width + kFusedInputSkew), sizeof(__half) * (16u + 16u * kFusedIters) * (kFusedWidth + kFusedSkew));
 
         k_fully_fused_forward<<<blocks, threads, shmem_size, stream>>>(input, network.params.ptr, forward_hidden, output, network.input_width, network.hidden_matmuls);
-        return ((cudaGetLastError()) == cudaSuccess);
+        return cudaGetLastError() == cudaSuccess;
     }
 
     __global__ void k_compute_input_grad_prefix(const __half* __restrict__ weights, const __half* __restrict__ backprop, const std::uint32_t rows, const std::uint32_t input_width, const std::uint32_t output_width, const std::uint32_t prefix_width, __half* __restrict__ dinput) {
@@ -1525,14 +1525,14 @@ namespace nerf::network {
                 const std::uint32_t tile_in     = idx - tile_out * 16u;
                 const std::uint32_t global_out  = output_base + tile_out;
                 const std::uint32_t global_in   = blockIdx.x * 16u + tile_in;
-                weights_tile[tile_out][tile_in] = (global_out < output_width && global_in < prefix_width) ? weights[static_cast<std::uint64_t>(global_out) * input_width + global_in] : __float2half_rn(0.0f);
+                weights_tile[tile_out][tile_in] = global_out < output_width && global_in < prefix_width ? weights[static_cast<std::uint64_t>(global_out) * input_width + global_in] : __float2half_rn(0.0f);
             }
             for (std::uint32_t idx = tid; idx < 16u * 32u; idx += blockDim.x * blockDim.y) {
                 const std::uint32_t tile_row      = idx / 32u;
                 const std::uint32_t tile_out      = idx - tile_row * 32u;
                 const std::uint32_t global_row    = blockIdx.y * 16u + tile_row;
                 const std::uint32_t global_out    = output_base + tile_out;
-                backprop_tile[tile_row][tile_out] = (global_row < rows && global_out < output_width) ? backprop[static_cast<std::uint64_t>(global_row) * output_width + global_out] : __float2half_rn(0.0f);
+                backprop_tile[tile_row][tile_out] = global_row < rows && global_out < output_width ? backprop[static_cast<std::uint64_t>(global_row) * output_width + global_out] : __float2half_rn(0.0f);
             }
             __syncthreads();
 
@@ -1559,7 +1559,7 @@ namespace nerf::network {
         constexpr std::size_t shmem_size = kFusedBackwardShmem;
 
         k_fully_fused_backward<<<blocks, threads, shmem_size, stream>>>(doutput, network.params.ptr + static_cast<std::uint64_t>(kFusedWidth) * network.input_width, backward_hidden, forward_hidden, rows, network.hidden_matmuls);
-        if ((cudaGetLastError()) != cudaSuccess) return false;
+        if (cudaGetLastError() != cudaSuccess) return false;
 
         constexpr float alpha              = kBlasAlpha;
         constexpr float beta               = kBlasBeta;
@@ -1572,7 +1572,7 @@ namespace nerf::network {
 
         gradient_offset += static_cast<std::uint64_t>(kFusedWidth) * network.input_width;
         gradient_offset += static_cast<std::uint64_t>(network.hidden_matmuls) * kFusedWidth * kFusedWidth;
-        if (cublasGemmEx(handle, CUBLAS_OP_N, CUBLAS_OP_T, static_cast<int>(kFusedWidth), static_cast<int>(kFusedOutputWidth), static_cast<int>(rows), &alpha, last_hidden, CUDA_R_16F, static_cast<int>(kFusedWidth), doutput, CUDA_R_16F, static_cast<int>(kFusedOutputWidth), &beta, network.gradients_tmp.ptr + gradient_offset, CUDA_R_16F, static_cast<int>(kFusedWidth), CUBLAS_COMPUTE_32F_FAST_16F, CUBLAS_GEMM_DEFAULT_TENSOR_OP) != CUBLAS_STATUS_SUCCESS) return false;
+        if (cublasGemmEx(handle, CUBLAS_OP_N, CUBLAS_OP_T, kFusedWidth, kFusedOutputWidth, static_cast<int>(rows), &alpha, last_hidden, CUDA_R_16F, kFusedWidth, doutput, CUDA_R_16F, kFusedOutputWidth, &beta, network.gradients_tmp.ptr + gradient_offset, CUDA_R_16F, kFusedWidth, CUBLAS_COMPUTE_32F_FAST_16F, CUBLAS_GEMM_DEFAULT_TENSOR_OP) != CUBLAS_STATUS_SUCCESS) return false;
 
         gradient_offset = static_cast<std::uint64_t>(kFusedWidth) * network.input_width;
         for (std::uint32_t layer = 0u; layer < network.hidden_matmuls; ++layer) {
@@ -1580,14 +1580,14 @@ namespace nerf::network {
             const __half* const activations  = first_hidden + static_cast<std::uint64_t>(weight_index) * kFusedWidth * rows;
             const __half* const backprop     = first_backprop + static_cast<std::uint64_t>(layer) * kFusedWidth * rows;
             const std::uint64_t layer_offset = gradient_offset + static_cast<std::uint64_t>(weight_index) * kFusedWidth * kFusedWidth;
-            if (cublasGemmEx(handle, CUBLAS_OP_N, CUBLAS_OP_T, static_cast<int>(kFusedWidth), static_cast<int>(kFusedWidth), static_cast<int>(rows), &alpha, activations, CUDA_R_16F, static_cast<int>(kFusedWidth), backprop, CUDA_R_16F, static_cast<int>(kFusedWidth), &beta, network.gradients_tmp.ptr + layer_offset, CUDA_R_16F, static_cast<int>(kFusedWidth), CUBLAS_COMPUTE_32F_FAST_16F, CUBLAS_GEMM_DEFAULT_TENSOR_OP) != CUBLAS_STATUS_SUCCESS) return false;
+            if (cublasGemmEx(handle, CUBLAS_OP_N, CUBLAS_OP_T, kFusedWidth, kFusedWidth, static_cast<int>(rows), &alpha, activations, CUDA_R_16F, kFusedWidth, backprop, CUDA_R_16F, kFusedWidth, &beta, network.gradients_tmp.ptr + layer_offset, CUDA_R_16F, kFusedWidth, CUBLAS_COMPUTE_32F_FAST_16F, CUBLAS_GEMM_DEFAULT_TENSOR_OP) != CUBLAS_STATUS_SUCCESS) return false;
         }
 
-        if (cublasGemmEx(handle, CUBLAS_OP_N, CUBLAS_OP_T, static_cast<int>(network.input_width), static_cast<int>(kFusedWidth), static_cast<int>(rows), &alpha, input, CUDA_R_16F, static_cast<int>(network.input_width), last_backprop, CUDA_R_16F, static_cast<int>(kFusedWidth), &beta, network.gradients_tmp.ptr, CUDA_R_16F, static_cast<int>(network.input_width), CUBLAS_COMPUTE_32F_FAST_16F, CUBLAS_GEMM_DEFAULT_TENSOR_OP) != CUBLAS_STATUS_SUCCESS) return false;
+        if (cublasGemmEx(handle, CUBLAS_OP_N, CUBLAS_OP_T, static_cast<int>(network.input_width), kFusedWidth, static_cast<int>(rows), &alpha, input, CUDA_R_16F, static_cast<int>(network.input_width), last_backprop, CUDA_R_16F, kFusedWidth, &beta, network.gradients_tmp.ptr, CUDA_R_16F, static_cast<int>(network.input_width), CUBLAS_COMPUTE_32F_FAST_16F, CUBLAS_GEMM_DEFAULT_TENSOR_OP) != CUBLAS_STATUS_SUCCESS) return false;
 
         if (dinput != nullptr && dinput_prefix_width != 0u) {
             k_compute_input_grad_prefix<<<dim3{(dinput_prefix_width + 15u) / 16u, (rows + 15u) / 16u, 1u}, input_grad_threads, 0, stream>>>(network.params.ptr, last_backprop, rows, network.input_width, kFusedWidth, dinput_prefix_width, dinput);
-            if ((cudaGetLastError()) != cudaSuccess) return false;
+            if (cudaGetLastError() != cudaSuccess) return false;
         }
 
         return true;
@@ -1794,29 +1794,29 @@ namespace nerf::network {
 
     bool run_network_inference(NetworkSet& network_set, NetworkWorkspace& workspace, cudaStream_t stream, const NetworkInferenceRequest& request) {
         const std::uint32_t rows          = request.rows;
-        const std::uint32_t padded_rows   = ((rows + kNetworkBatchGranularity - 1u) / kNetworkBatchGranularity) * kNetworkBatchGranularity;
+        const std::uint32_t padded_rows   = (rows + kNetworkBatchGranularity - 1u) / kNetworkBatchGranularity * kNetworkBatchGranularity;
         constexpr std::uint32_t threads   = kThreads256;
         const std::uint32_t density_total = padded_rows * kDensityInputDim;
         const std::uint32_t color_total   = padded_rows * kColorInputDim;
         const std::uint32_t output_blocks = (rows + threads - 1u) / threads;
 
         k_pack_density_input<<<(density_total + threads - 1u) / threads, threads, 0, stream>>>(request.encoded_pts, rows, padded_rows, workspace.density_input);
-        if (((cudaGetLastError()) != cudaSuccess)) return false;
+        if (cudaGetLastError() != cudaSuccess) return false;
         if (!fully_fused_mlp_inference(network_set.density, stream, workspace.density_input, padded_rows, workspace.density_output)) return false;
 
         k_pack_color_input<<<(color_total + threads - 1u) / threads, threads, 0, stream>>>(workspace.density_output, request.encoded_dir, rows, padded_rows, workspace.color_input);
-        if (((cudaGetLastError()) != cudaSuccess)) return false;
+        if (cudaGetLastError() != cudaSuccess) return false;
         if (!fully_fused_mlp_inference(network_set.color, stream, workspace.color_input, padded_rows, workspace.color_output)) return false;
 
         k_unpack_network_outputs<<<output_blocks, threads, 0, stream>>>(workspace.density_output, workspace.color_output, rows, request.raw_rgb, request.raw_sigma);
-        return ((cudaGetLastError()) == cudaSuccess);
+        return cudaGetLastError() == cudaSuccess;
     }
 
     __global__ void k_ray_march_mse_grad(const float* __restrict__ raw_rgb, const float* __restrict__ raw_sigma, const nerf::sampler::SampleStep* __restrict__ sample_steps, const nerf::sampler::SampleRay* __restrict__ rays, const nerf::sampler::SampleBatchState* __restrict__ batch_state, std::uint32_t ray_count, float* __restrict__ d_raw_rgb, float* __restrict__ d_raw_sigma, float* __restrict__ trans_tmp, float* __restrict__ loss_sum) {
         const std::uint32_t local_ray   = blockIdx.x * blockDim.x + threadIdx.x;
         float ray_loss                  = 0.0f;
         const std::uint32_t active_rays = batch_state->active_ray_count;
-        const float inv_norm            = active_rays == 0u ? 0.0f : (1.0f / static_cast<float>(active_rays));
+        const float inv_norm            = active_rays == 0u ? 0.0f : 1.0f / static_cast<float>(active_rays);
         if (local_ray < ray_count) {
             const nerf::sampler::SampleRay ray = rays[local_ray];
             const std::uint32_t count          = ray.sample_count;
@@ -1847,7 +1847,7 @@ namespace nerf::network {
                     accum_g += w * g;
                     accum_b += w * b;
 
-                    T *= (1.0f - a);
+                    T *= 1.0f - a;
                 }
 
                 const float pred_r = accum_r + T;
@@ -1922,39 +1922,39 @@ namespace nerf::network {
     }
 
     bool run_network_training(NetworkSet& network_set, NetworkWorkspace& workspace, cudaStream_t stream, const NetworkTrainingRequest& request) {
-        const std::uint32_t padded_rows = ((request.sample_count + kNetworkBatchGranularity - 1u) / kNetworkBatchGranularity) * kNetworkBatchGranularity;
+        const std::uint32_t padded_rows = (request.sample_count + kNetworkBatchGranularity - 1u) / kNetworkBatchGranularity * kNetworkBatchGranularity;
         constexpr std::uint32_t threads = kThreads256;
         bool ok                         = false;
 
         do {
             k_pack_train_density_input<<<(padded_rows * kDensityInputDim + threads - 1u) / threads, threads, 0, stream>>>(request.sample_steps, request.sample_count, padded_rows, workspace.density_input);
-            if (((cudaGetLastError()) != cudaSuccess)) break;
+            if (cudaGetLastError() != cudaSuccess) break;
             if (!fully_fused_mlp_forward(network_set.density, stream, workspace.density_input, padded_rows, workspace.density_output, workspace.density_forward_hidden)) break;
 
             k_pack_train_color_input<<<(padded_rows * kColorInputDim + threads - 1u) / threads, threads, 0, stream>>>(request.sample_steps, workspace.density_output, request.sample_count, padded_rows, workspace.color_input);
-            if (((cudaGetLastError()) != cudaSuccess)) break;
+            if (cudaGetLastError() != cudaSuccess) break;
             if (!fully_fused_mlp_forward(network_set.color, stream, workspace.color_input, padded_rows, workspace.color_output, workspace.color_forward_hidden)) break;
 
             k_unpack_network_outputs<<<(request.sample_count + threads - 1u) / threads, threads, 0, stream>>>(workspace.density_output, workspace.color_output, request.sample_count, workspace.raw_rgb, workspace.raw_sigma);
-            if (((cudaGetLastError()) != cudaSuccess)) break;
+            if (cudaGetLastError() != cudaSuccess) break;
 
-            if (((cudaMemsetAsync(workspace.d_rgb, 0, static_cast<std::uint64_t>(request.sample_count) * 3ull * sizeof(float), stream)) != cudaSuccess)) break;
-            if (((cudaMemsetAsync(workspace.d_sigma, 0, static_cast<std::uint64_t>(request.sample_count) * sizeof(float), stream)) != cudaSuccess)) break;
+            if (cudaMemsetAsync(workspace.d_rgb, 0, static_cast<std::uint64_t>(request.sample_count) * 3ull * sizeof(float), stream) != cudaSuccess) break;
+            if (cudaMemsetAsync(workspace.d_sigma, 0, static_cast<std::uint64_t>(request.sample_count) * sizeof(float), stream) != cudaSuccess) break;
 
             k_ray_march_mse_grad<<<(request.ray_count + threads - 1u) / threads, threads, 0, stream>>>(workspace.raw_rgb, workspace.raw_sigma, request.sample_steps, request.sample_rays, request.batch_state, request.ray_count, workspace.d_rgb, workspace.d_sigma, workspace.trans_tmp, workspace.loss_sum);
-            if (((cudaGetLastError()) != cudaSuccess)) break;
+            if (cudaGetLastError() != cudaSuccess) break;
 
             k_pack_color_output_grad<<<(padded_rows * kColorOutputPaddedDim + threads - 1u) / threads, threads, 0, stream>>>(workspace.d_rgb, request.sample_count, padded_rows, kNetworkLossScale, workspace.color_doutput);
-            if (((cudaGetLastError()) != cudaSuccess)) break;
+            if (cudaGetLastError() != cudaSuccess) break;
             if (!fully_fused_mlp_backward(network_set.color, network_set.blas_handle, stream, workspace.color_input, workspace.color_doutput, padded_rows, kGeoFeatureDim, workspace.color_dinput, workspace.color_backward_hidden, workspace.color_forward_hidden)) break;
             k_accumulate_gradients_half<<<(static_cast<std::uint32_t>(network_set.color.gradients.count) + threads - 1u) / threads, threads, 0, stream>>>(network_set.color.gradients.ptr, network_set.color.gradients_tmp.ptr, static_cast<std::uint32_t>(network_set.color.gradients.count));
 
             k_pack_density_output_grad<<<(padded_rows * kDensityOutputDim + threads - 1u) / threads, threads, 0, stream>>>(workspace.d_sigma, workspace.color_dinput, request.sample_count, padded_rows, kNetworkLossScale, workspace.density_doutput);
-            if (((cudaGetLastError()) != cudaSuccess)) break;
+            if (cudaGetLastError() != cudaSuccess) break;
             if (!fully_fused_mlp_backward(network_set.density, network_set.blas_handle, stream, workspace.density_input, workspace.density_doutput, padded_rows, 0u, nullptr, workspace.density_backward_hidden, workspace.density_forward_hidden)) break;
             k_accumulate_gradients_half<<<(static_cast<std::uint32_t>(network_set.density.gradients.count) + threads - 1u) / threads, threads, 0, stream>>>(network_set.density.gradients.ptr, network_set.density.gradients_tmp.ptr, static_cast<std::uint32_t>(network_set.density.gradients.count));
 
-            ok = ((cudaGetLastError()) == cudaSuccess);
+            ok = cudaGetLastError() == cudaSuccess;
         } while (false);
         return ok;
     }
@@ -2083,10 +2083,10 @@ namespace nerf::runtime {
     __global__ void k_finalize_training_stats(TrainingDeviceState* state, const nerf::sampler::SampleBatchState* batch_state, const float* loss_sum, const float* grad_sumsq, const std::uint32_t* nonfinite_flag) {
         if (blockIdx.x != 0u || threadIdx.x != 0u) return;
         const std::uint32_t active_rays   = batch_state->active_ray_count;
-        const float inv_norm              = active_rays == 0u ? 0.0f : (1.0f / static_cast<float>(active_rays));
-        const float loss                  = (*loss_sum) * inv_norm;
+        const float inv_norm              = active_rays == 0u ? 0.0f : 1.0f / static_cast<float>(active_rays);
+        const float loss                  = *loss_sum * inv_norm;
         const float grad_norm             = sqrtf(fmaxf(0.0f, *grad_sumsq)) / kNetworkLossScale;
-        const std::uint32_t has_nonfinite = ((*nonfinite_flag) != 0u || batch_state->overflow != 0u || !isfinite(loss) || !isfinite(grad_norm)) ? 1u : 0u;
+        const std::uint32_t has_nonfinite = *nonfinite_flag != 0u || batch_state->overflow != 0u || !isfinite(loss) || !isfinite(grad_norm) ? 1u : 0u;
         state->optimizer_step             = state->frame_index + 1u;
         state->stats.loss                 = loss;
         state->stats.grad_norm            = grad_norm;
@@ -2110,8 +2110,8 @@ namespace nerf::runtime {
         if (skip_update) return;
 
         const float decay                = static_cast<float>(lr_decay_ksteps) * 1000.0f;
-        const float learning_rate        = decay > 0.0f ? (base_learning_rate * powf(0.1f, static_cast<float>(state->optimizer_step) / decay)) : base_learning_rate;
-        const float grad_scale           = (grad_norm > kGlobalGradClipNorm && grad_norm > 0.0f) ? (kGlobalGradClipNorm / grad_norm) : 1.0f;
+        const float learning_rate        = decay > 0.0f ? base_learning_rate * powf(0.1f, static_cast<float>(state->optimizer_step) / decay) : base_learning_rate;
+        const float grad_scale           = grad_norm > kGlobalGradClipNorm && grad_norm > 0.0f ? kGlobalGradClipNorm / grad_norm : 1.0f;
         const float inv_bias_correction1 = 1.0f / (1.0f - powf(beta1, static_cast<float>(state->optimizer_step)));
         const float inv_bias_correction2 = 1.0f / (1.0f - powf(beta2, static_cast<float>(state->optimizer_step)));
         const float grad                 = __half2float(grads[idx]) * inv_loss_scale;
@@ -2169,14 +2169,14 @@ namespace nerf::runtime {
     }
 
     static bool alloc_workspace(nerf::network::NetworkWorkspace& workspace, const std::uint32_t rows) {
-        const std::uint32_t padded_rows = ((rows + kNetworkBatchGranularity - 1u) / kNetworkBatchGranularity) * kNetworkBatchGranularity;
+        const std::uint32_t padded_rows = (rows + kNetworkBatchGranularity - 1u) / kNetworkBatchGranularity * kNetworkBatchGranularity;
         if (workspace.rows_capacity >= padded_rows) return true;
 
         free_workspace(workspace);
 
         const std::uint64_t row_count       = padded_rows;
         constexpr std::uint64_t arena_align = kArenaAlignBytes;
-        const auto align_up                 = [](const std::uint64_t value, const std::uint64_t alignment) -> std::uint64_t { return (value + alignment - 1u) & ~(alignment - 1u); };
+        const auto align_up                 = [](const std::uint64_t value, const std::uint64_t alignment) -> std::uint64_t { return value + alignment - 1u & ~(alignment - 1u); };
 
         std::uint64_t total = 0u;
         const auto reserve  = [&](const std::uint64_t bytes) {
@@ -2207,7 +2207,7 @@ namespace nerf::runtime {
         reserve(static_cast<std::uint64_t>(kColorHiddenLayers) * row_count * kColorWidth * sizeof(__half));
         reserve(static_cast<std::uint64_t>(kColorHiddenLayers) * row_count * kColorWidth * sizeof(__half));
 
-        if (((cudaMalloc(&workspace.arena, static_cast<std::size_t>(total))) != cudaSuccess)) return false;
+        if (cudaMalloc(&workspace.arena, total) != cudaSuccess) return false;
 
         std::uint64_t offset = 0u;
         const auto place     = [&]<typename T0>(T0& field, const std::uint64_t bytes) {
@@ -2247,11 +2247,11 @@ namespace nerf::runtime {
         try {
             int device = 0;
             cudaDeviceProp prop{};
-            if (((cudaGetDevice(&device)) != cudaSuccess)) return false;
-            if (((cudaGetDeviceProperties(&prop, device)) != cudaSuccess)) return false;
+            if (cudaGetDevice(&device) != cudaSuccess) return false;
+            if (cudaGetDeviceProperties(&prop, device) != cudaSuccess) return false;
             if (prop.major * 10 + prop.minor < 75) return false;
 
-            if (((cudaStreamCreateWithFlags(&rt.stream, cudaStreamNonBlocking)) != cudaSuccess)) return false;
+            if (cudaStreamCreateWithFlags(&rt.stream, cudaStreamNonBlocking) != cudaSuccess) return false;
             rt.network.density.input_width      = kDensityInputDim;
             rt.network.density.width            = kDensityWidth;
             rt.network.density.output_width     = kDensityOutputDim;
@@ -2274,35 +2274,35 @@ namespace nerf::runtime {
             rt.network.color.adam_m.count          = rt.network.color.params_f32.count;
             rt.network.color.adam_v.count          = rt.network.color.params_f32.count;
 
-            rt.network.density.params_f32.bytes    = static_cast<std::size_t>(rt.network.density.params_f32.count) * sizeof(float);
-            rt.network.density.params.bytes        = static_cast<std::size_t>(rt.network.density.params.count) * sizeof(__half);
-            rt.network.density.gradients.bytes     = static_cast<std::size_t>(rt.network.density.gradients.count) * sizeof(__half);
-            rt.network.density.gradients_tmp.bytes = static_cast<std::size_t>(rt.network.density.gradients_tmp.count) * sizeof(__half);
-            rt.network.density.adam_m.bytes        = static_cast<std::size_t>(rt.network.density.adam_m.count) * sizeof(float);
-            rt.network.density.adam_v.bytes        = static_cast<std::size_t>(rt.network.density.adam_v.count) * sizeof(float);
-            rt.network.color.params_f32.bytes      = static_cast<std::size_t>(rt.network.color.params_f32.count) * sizeof(float);
-            rt.network.color.params.bytes          = static_cast<std::size_t>(rt.network.color.params.count) * sizeof(__half);
-            rt.network.color.gradients.bytes       = static_cast<std::size_t>(rt.network.color.gradients.count) * sizeof(__half);
-            rt.network.color.gradients_tmp.bytes   = static_cast<std::size_t>(rt.network.color.gradients_tmp.count) * sizeof(__half);
-            rt.network.color.adam_m.bytes          = static_cast<std::size_t>(rt.network.color.adam_m.count) * sizeof(float);
-            rt.network.color.adam_v.bytes          = static_cast<std::size_t>(rt.network.color.adam_v.count) * sizeof(float);
+            rt.network.density.params_f32.bytes    = rt.network.density.params_f32.count * sizeof(float);
+            rt.network.density.params.bytes        = rt.network.density.params.count * sizeof(__half);
+            rt.network.density.gradients.bytes     = rt.network.density.gradients.count * sizeof(__half);
+            rt.network.density.gradients_tmp.bytes = rt.network.density.gradients_tmp.count * sizeof(__half);
+            rt.network.density.adam_m.bytes        = rt.network.density.adam_m.count * sizeof(float);
+            rt.network.density.adam_v.bytes        = rt.network.density.adam_v.count * sizeof(float);
+            rt.network.color.params_f32.bytes      = rt.network.color.params_f32.count * sizeof(float);
+            rt.network.color.params.bytes          = rt.network.color.params.count * sizeof(__half);
+            rt.network.color.gradients.bytes       = rt.network.color.gradients.count * sizeof(__half);
+            rt.network.color.gradients_tmp.bytes   = rt.network.color.gradients_tmp.count * sizeof(__half);
+            rt.network.color.adam_m.bytes          = rt.network.color.adam_m.count * sizeof(float);
+            rt.network.color.adam_v.bytes          = rt.network.color.adam_v.count * sizeof(float);
 
-            if (((cudaMalloc(&rt.network.density.params_f32.ptr, rt.network.density.params_f32.bytes)) != cudaSuccess)) return false;
-            if (((cudaMalloc(&rt.network.density.params.ptr, rt.network.density.params.bytes)) != cudaSuccess)) return false;
-            if (((cudaMalloc(&rt.network.density.gradients.ptr, rt.network.density.gradients.bytes)) != cudaSuccess)) return false;
-            if (((cudaMalloc(&rt.network.density.gradients_tmp.ptr, rt.network.density.gradients_tmp.bytes)) != cudaSuccess)) return false;
-            if (((cudaMalloc(&rt.network.density.adam_m.ptr, rt.network.density.adam_m.bytes)) != cudaSuccess)) return false;
-            if (((cudaMalloc(&rt.network.density.adam_v.ptr, rt.network.density.adam_v.bytes)) != cudaSuccess)) return false;
-            if (((cudaMalloc(&rt.network.color.params_f32.ptr, rt.network.color.params_f32.bytes)) != cudaSuccess)) return false;
-            if (((cudaMalloc(&rt.network.color.params.ptr, rt.network.color.params.bytes)) != cudaSuccess)) return false;
-            if (((cudaMalloc(&rt.network.color.gradients.ptr, rt.network.color.gradients.bytes)) != cudaSuccess)) return false;
-            if (((cudaMalloc(&rt.network.color.gradients_tmp.ptr, rt.network.color.gradients_tmp.bytes)) != cudaSuccess)) return false;
-            if (((cudaMalloc(&rt.network.color.adam_m.ptr, rt.network.color.adam_m.bytes)) != cudaSuccess)) return false;
-            if (((cudaMalloc(&rt.network.color.adam_v.ptr, rt.network.color.adam_v.bytes)) != cudaSuccess)) return false;
-            if (((cudaMalloc(&rt.device_state, sizeof(TrainingDeviceState))) != cudaSuccess)) return false;
+            if (cudaMalloc(&rt.network.density.params_f32.ptr, rt.network.density.params_f32.bytes) != cudaSuccess) return false;
+            if (cudaMalloc(&rt.network.density.params.ptr, rt.network.density.params.bytes) != cudaSuccess) return false;
+            if (cudaMalloc(&rt.network.density.gradients.ptr, rt.network.density.gradients.bytes) != cudaSuccess) return false;
+            if (cudaMalloc(&rt.network.density.gradients_tmp.ptr, rt.network.density.gradients_tmp.bytes) != cudaSuccess) return false;
+            if (cudaMalloc(&rt.network.density.adam_m.ptr, rt.network.density.adam_m.bytes) != cudaSuccess) return false;
+            if (cudaMalloc(&rt.network.density.adam_v.ptr, rt.network.density.adam_v.bytes) != cudaSuccess) return false;
+            if (cudaMalloc(&rt.network.color.params_f32.ptr, rt.network.color.params_f32.bytes) != cudaSuccess) return false;
+            if (cudaMalloc(&rt.network.color.params.ptr, rt.network.color.params.bytes) != cudaSuccess) return false;
+            if (cudaMalloc(&rt.network.color.gradients.ptr, rt.network.color.gradients.bytes) != cudaSuccess) return false;
+            if (cudaMalloc(&rt.network.color.gradients_tmp.ptr, rt.network.color.gradients_tmp.bytes) != cudaSuccess) return false;
+            if (cudaMalloc(&rt.network.color.adam_m.ptr, rt.network.color.adam_m.bytes) != cudaSuccess) return false;
+            if (cudaMalloc(&rt.network.color.adam_v.ptr, rt.network.color.adam_v.bytes) != cudaSuccess) return false;
+            if (cudaMalloc(&rt.device_state, sizeof(TrainingDeviceState)) != cudaSuccess) return false;
 
             std::vector<float> density_host_params(rt.network.density.params_f32.count);
-            std::uint64_t density_rng_state = (0x1234ull + 0x9e3779b97f4a7c15ull) ^ (0x5678ull * 0xbf58476d1ce4e5b9ull);
+            std::uint64_t density_rng_state = 0x1234ull + 0x9e3779b97f4a7c15ull ^ 0x5678ull * 0xbf58476d1ce4e5b9ull;
             std::uint64_t density_offset    = 0u;
             for (std::uint32_t matrix_idx = 0u; matrix_idx < rt.network.density.hidden_matmuls + 2u; ++matrix_idx) {
                 const std::uint32_t fan_in  = matrix_idx == 0u ? kDensityInputDim : kDensityWidth;
@@ -2312,17 +2312,17 @@ namespace nerf::runtime {
                 for (std::uint64_t index = 0u; index < count; ++index) {
                     density_rng_state += 0x9e3779b97f4a7c15ull;
                     std::uint64_t z = density_rng_state;
-                    z               = (z ^ (z >> 30u)) * 0xbf58476d1ce4e5b9ull;
-                    z               = (z ^ (z >> 27u)) * 0x94d049bb133111ebull;
-                    z ^= (z >> 31u);
-                    density_host_params[density_offset + index] = ((static_cast<float>(static_cast<std::uint32_t>(z >> 32u) >> 8u) * (1.0f / 16777216.0f)) * 2.0f - 1.0f) * scale;
+                    z               = (z ^ z >> 30u) * 0xbf58476d1ce4e5b9ull;
+                    z               = (z ^ z >> 27u) * 0x94d049bb133111ebull;
+                    z ^= z >> 31u;
+                    density_host_params[density_offset + index] = (static_cast<float>(static_cast<std::uint32_t>(z >> 32u) >> 8u) * (1.0f / 16777216.0f) * 2.0f - 1.0f) * scale;
                 }
                 density_offset += count;
             }
-            if (((cudaMemcpy(rt.network.density.params_f32.ptr, density_host_params.data(), rt.network.density.params_f32.bytes, cudaMemcpyHostToDevice)) != cudaSuccess)) return false;
+            if (cudaMemcpy(rt.network.density.params_f32.ptr, density_host_params.data(), rt.network.density.params_f32.bytes, cudaMemcpyHostToDevice) != cudaSuccess) return false;
 
             std::vector<float> color_host_params(rt.network.color.params_f32.count);
-            std::uint64_t color_rng_state = (0x9abcull + 0x9e3779b97f4a7c15ull) ^ (0xdef0ull * 0xbf58476d1ce4e5b9ull);
+            std::uint64_t color_rng_state = 0x9abcull + 0x9e3779b97f4a7c15ull ^ 0xdef0ull * 0xbf58476d1ce4e5b9ull;
             std::uint64_t color_offset    = 0u;
             for (std::uint32_t matrix_idx = 0u; matrix_idx < rt.network.color.hidden_matmuls + 2u; ++matrix_idx) {
                 const std::uint32_t fan_in  = matrix_idx == 0u ? kColorInputDim : kColorWidth;
@@ -2332,33 +2332,33 @@ namespace nerf::runtime {
                 for (std::uint64_t index = 0u; index < count; ++index) {
                     color_rng_state += 0x9e3779b97f4a7c15ull;
                     std::uint64_t z = color_rng_state;
-                    z               = (z ^ (z >> 30u)) * 0xbf58476d1ce4e5b9ull;
-                    z               = (z ^ (z >> 27u)) * 0x94d049bb133111ebull;
-                    z ^= (z >> 31u);
-                    color_host_params[color_offset + index] = ((static_cast<float>(static_cast<std::uint32_t>(z >> 32u) >> 8u) * (1.0f / 16777216.0f)) * 2.0f - 1.0f) * scale;
+                    z               = (z ^ z >> 30u) * 0xbf58476d1ce4e5b9ull;
+                    z               = (z ^ z >> 27u) * 0x94d049bb133111ebull;
+                    z ^= z >> 31u;
+                    color_host_params[color_offset + index] = (static_cast<float>(static_cast<std::uint32_t>(z >> 32u) >> 8u) * (1.0f / 16777216.0f) * 2.0f - 1.0f) * scale;
                 }
                 color_offset += count;
             }
-            if (((cudaMemcpy(rt.network.color.params_f32.ptr, color_host_params.data(), rt.network.color.params_f32.bytes, cudaMemcpyHostToDevice)) != cudaSuccess)) return false;
+            if (cudaMemcpy(rt.network.color.params_f32.ptr, color_host_params.data(), rt.network.color.params_f32.bytes, cudaMemcpyHostToDevice) != cudaSuccess) return false;
 
             constexpr std::uint32_t convert_threads = kConvertThreads;
             k_float_to_half<<<(static_cast<std::uint32_t>(rt.network.density.params.count) + convert_threads - 1u) / convert_threads, convert_threads, 0, rt.stream>>>(rt.network.density.params_f32.ptr, rt.network.density.params.ptr, static_cast<std::uint32_t>(rt.network.density.params.count));
             k_float_to_half<<<(static_cast<std::uint32_t>(rt.network.color.params.count) + convert_threads - 1u) / convert_threads, convert_threads, 0, rt.stream>>>(rt.network.color.params_f32.ptr, rt.network.color.params.ptr, static_cast<std::uint32_t>(rt.network.color.params.count));
-            if (((cudaGetLastError()) != cudaSuccess)) return false;
+            if (cudaGetLastError() != cudaSuccess) return false;
 
-            if (((cudaMemsetAsync(rt.network.density.gradients.ptr, 0, rt.network.density.gradients.bytes, rt.stream)) != cudaSuccess)) return false;
-            if (((cudaMemsetAsync(rt.network.density.gradients_tmp.ptr, 0, rt.network.density.gradients_tmp.bytes, rt.stream)) != cudaSuccess)) return false;
-            if (((cudaMemsetAsync(rt.network.density.adam_m.ptr, 0, rt.network.density.adam_m.bytes, rt.stream)) != cudaSuccess)) return false;
-            if (((cudaMemsetAsync(rt.network.density.adam_v.ptr, 0, rt.network.density.adam_v.bytes, rt.stream)) != cudaSuccess)) return false;
-            if (((cudaMemsetAsync(rt.network.color.gradients.ptr, 0, rt.network.color.gradients.bytes, rt.stream)) != cudaSuccess)) return false;
-            if (((cudaMemsetAsync(rt.network.color.gradients_tmp.ptr, 0, rt.network.color.gradients_tmp.bytes, rt.stream)) != cudaSuccess)) return false;
-            if (((cudaMemsetAsync(rt.network.color.adam_m.ptr, 0, rt.network.color.adam_m.bytes, rt.stream)) != cudaSuccess)) return false;
-            if (((cudaMemsetAsync(rt.network.color.adam_v.ptr, 0, rt.network.color.adam_v.bytes, rt.stream)) != cudaSuccess)) return false;
-            if (((cudaMemsetAsync(rt.device_state, 0, sizeof(TrainingDeviceState), rt.stream)) != cudaSuccess)) return false;
+            if (cudaMemsetAsync(rt.network.density.gradients.ptr, 0, rt.network.density.gradients.bytes, rt.stream) != cudaSuccess) return false;
+            if (cudaMemsetAsync(rt.network.density.gradients_tmp.ptr, 0, rt.network.density.gradients_tmp.bytes, rt.stream) != cudaSuccess) return false;
+            if (cudaMemsetAsync(rt.network.density.adam_m.ptr, 0, rt.network.density.adam_m.bytes, rt.stream) != cudaSuccess) return false;
+            if (cudaMemsetAsync(rt.network.density.adam_v.ptr, 0, rt.network.density.adam_v.bytes, rt.stream) != cudaSuccess) return false;
+            if (cudaMemsetAsync(rt.network.color.gradients.ptr, 0, rt.network.color.gradients.bytes, rt.stream) != cudaSuccess) return false;
+            if (cudaMemsetAsync(rt.network.color.gradients_tmp.ptr, 0, rt.network.color.gradients_tmp.bytes, rt.stream) != cudaSuccess) return false;
+            if (cudaMemsetAsync(rt.network.color.adam_m.ptr, 0, rt.network.color.adam_m.bytes, rt.stream) != cudaSuccess) return false;
+            if (cudaMemsetAsync(rt.network.color.adam_v.ptr, 0, rt.network.color.adam_v.bytes, rt.stream) != cudaSuccess) return false;
+            if (cudaMemsetAsync(rt.device_state, 0, sizeof(TrainingDeviceState), rt.stream) != cudaSuccess) return false;
 
             if (!alloc_workspace(rt.workspace, kTrainChunkRows + kNetworkBatchGranularity)) return false;
             if (!nerf::network::init_network_module(rt.network, rt.stream)) return false;
-            if (((cudaStreamSynchronize(rt.stream)) != cudaSuccess)) return false;
+            if (cudaStreamSynchronize(rt.stream) != cudaSuccess) return false;
             return true;
         } catch (...) {
             destroy_runtime(rt);
@@ -2392,7 +2392,7 @@ namespace nerf::runtime {
 
     static bool prepare_training_device_state(TrainRuntime& runtime, const std::uint32_t camera_idx) {
         k_begin_training_step<<<1, 1, 0, runtime.stream>>>(runtime.device_state, camera_idx);
-        return ((cudaGetLastError()) == cudaSuccess);
+        return cudaGetLastError() == cudaSuccess;
     }
 
     static bool read_training_device_stats(DeviceContext* device_context, NerfTrainStats* out_stats) {
@@ -2400,22 +2400,22 @@ namespace nerf::runtime {
         const auto runtime = runtime_for_context(device_context);
         if (!runtime) return false;
         std::scoped_lock run_lock(runtime->run_mutex);
-        if (((cudaStreamSynchronize(runtime->stream)) != cudaSuccess)) return false;
-        if (((cudaMemcpy(out_stats, &runtime->device_state->stats, sizeof(NerfTrainStats), cudaMemcpyDeviceToHost)) != cudaSuccess)) return false;
+        if (cudaStreamSynchronize(runtime->stream) != cudaSuccess) return false;
+        if (cudaMemcpy(out_stats, &runtime->device_state->stats, sizeof(NerfTrainStats), cudaMemcpyDeviceToHost) != cudaSuccess) return false;
         runtime->host_frame_index = out_stats->completed_steps;
         return true;
     }
 
     static bool runtime_zero_network_gradients(TrainRuntime& runtime) {
-        if (((cudaMemsetAsync(runtime.network.density.gradients.ptr, 0, runtime.network.density.gradients.bytes, runtime.stream)) != cudaSuccess)) return false;
-        if (((cudaMemsetAsync(runtime.network.color.gradients.ptr, 0, runtime.network.color.gradients.bytes, runtime.stream)) != cudaSuccess)) return false;
+        if (cudaMemsetAsync(runtime.network.density.gradients.ptr, 0, runtime.network.density.gradients.bytes, runtime.stream) != cudaSuccess) return false;
+        if (cudaMemsetAsync(runtime.network.color.gradients.ptr, 0, runtime.network.color.gradients.bytes, runtime.stream) != cudaSuccess) return false;
         return true;
     }
 
     static bool runtime_zero_scalar_buffers(TrainRuntime& runtime) {
-        if (((cudaMemsetAsync(runtime.workspace.loss_sum, 0, sizeof(float), runtime.stream)) != cudaSuccess)) return false;
-        if (((cudaMemsetAsync(runtime.workspace.grad_sumsq, 0, sizeof(float), runtime.stream)) != cudaSuccess)) return false;
-        if (((cudaMemsetAsync(runtime.workspace.nonfinite_flag, 0, sizeof(std::uint32_t), runtime.stream)) != cudaSuccess)) return false;
+        if (cudaMemsetAsync(runtime.workspace.loss_sum, 0, sizeof(float), runtime.stream) != cudaSuccess) return false;
+        if (cudaMemsetAsync(runtime.workspace.grad_sumsq, 0, sizeof(float), runtime.stream) != cudaSuccess) return false;
+        if (cudaMemsetAsync(runtime.workspace.nonfinite_flag, 0, sizeof(std::uint32_t), runtime.stream) != cudaSuccess) return false;
         return true;
     }
 
@@ -2449,7 +2449,7 @@ namespace nerf::runtime {
         if (color_n != 0u) {
             k_adam_step_half<<<(color_n + threads - 1u) / threads, threads, 0, runtime.stream>>>(runtime.network.color.params_f32.ptr, runtime.network.color.params.ptr, runtime.network.color.gradients.ptr, runtime.network.color.adam_m.ptr, runtime.network.color.adam_v.ptr, color_n, config.learning_rate, beta1, beta2, epsilon, config.lr_decay_ksteps, inv_loss_scale, runtime.device_state);
         }
-        if (((cudaGetLastError()) != cudaSuccess)) return false;
+        if (cudaGetLastError() != cudaSuccess) return false;
         return true;
     }
 
@@ -2458,7 +2458,7 @@ namespace nerf::runtime {
         if (idx >= count) return;
         if (state->frame_index < warmup_steps)
             data[idx] = 1.0f;
-        else if (state->frame_index == 0u || (state->frame_index % update_interval) == 0u)
+        else if (state->frame_index == 0u || state->frame_index % update_interval == 0u)
             data[idx] *= decay;
     }
 
@@ -2467,7 +2467,7 @@ namespace nerf::runtime {
         if (idx >= word_count) return;
         if (state->frame_index < warmup_steps)
             bitfield[idx] = 0xFFFFFFFFu;
-        else if (state->frame_index == 0u || (state->frame_index % update_interval) == 0u)
+        else if (state->frame_index == 0u || state->frame_index % update_interval == 0u)
             bitfield[idx] = 0u;
     }
 
@@ -2475,7 +2475,7 @@ namespace nerf::runtime {
         const std::uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
         if (idx >= total_rows) return;
 
-        if (state->frame_index < warmup_steps || (state->frame_index >= warmup_steps && state->frame_index != 0u && (state->frame_index % update_interval) != 0u)) {
+        if (state->frame_index < warmup_steps || (state->frame_index >= warmup_steps && state->frame_index != 0u && state->frame_index % update_interval != 0u)) {
             float* dst = out_inputs + static_cast<std::uint64_t>(idx) * 7ull;
             dst[0]     = 0.0f;
             dst[1]     = 0.0f;
@@ -2500,7 +2500,7 @@ namespace nerf::runtime {
             return;
         }
 
-        const std::uint32_t start_cell_base = static_cast<std::uint32_t>((static_cast<std::uint64_t>(state->frame_index) * update_count) % cell_count);
+        const std::uint32_t start_cell_base = static_cast<std::uint32_t>(static_cast<std::uint64_t>(state->frame_index) * update_count % cell_count);
         const std::uint32_t cell            = (start_cell_base + linear_idx) % cell_count;
         const std::uint32_t layer           = grid_res * grid_res;
         const std::uint32_t z               = cell / layer;
@@ -2523,14 +2523,14 @@ namespace nerf::runtime {
         const std::uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
         if (idx >= total_rows) return;
         if (state->frame_index < warmup_steps) return;
-        if (state->frame_index >= warmup_steps && state->frame_index != 0u && (state->frame_index % update_interval) != 0u) return;
+        if (state->frame_index >= warmup_steps && state->frame_index != 0u && state->frame_index % update_interval != 0u) return;
         const std::uint32_t update_count = min(cells_per_update, cell_count);
         const std::uint32_t linear_idx   = idx;
         if (linear_idx >= update_count) return;
-        const std::uint32_t start_cell_base = static_cast<std::uint32_t>((static_cast<std::uint64_t>(state->frame_index) * update_count) % cell_count);
+        const std::uint32_t start_cell_base = static_cast<std::uint32_t>(static_cast<std::uint64_t>(state->frame_index) * update_count % cell_count);
         const std::uint32_t cell            = (start_cell_base + linear_idx) % cell_count;
         const float sig_raw                 = raw_sigma[idx];
-        const float sigma                   = (sig_raw > 20.0f) ? sig_raw : ((sig_raw < -20.0f) ? __expf(sig_raw) : log1pf(__expf(sig_raw)));
+        const float sigma                   = sig_raw > 20.0f ? sig_raw : sig_raw < -20.0f ? __expf(sig_raw) : log1pf(__expf(sig_raw));
         density_grid[cell]                  = fmaxf(density_grid[cell], sigma);
     }
 
@@ -2538,7 +2538,7 @@ namespace nerf::runtime {
         const std::uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
         if (idx >= cell_count) return;
         if (state->frame_index < warmup_steps) return;
-        if (state->frame_index >= warmup_steps && state->frame_index != 0u && (state->frame_index % update_interval) != 0u) return;
+        if (state->frame_index >= warmup_steps && state->frame_index != 0u && state->frame_index % update_interval != 0u) return;
         if (density_grid[idx] <= threshold) return;
         atomicOr(&bitfield[idx >> 5u], 1u << (idx & 31u));
     }
@@ -2565,7 +2565,7 @@ namespace nerf::runtime {
         k_update_density_from_sigma<<<tile_grid, block_x, 0, runtime.stream>>>(request.density_grid, runtime.workspace.raw_sigma, request.device_state, total_rows, request.cells_per_update, cell_count, request.warmup_steps, request.update_interval);
         if (const cudaError_t error = cudaGetLastError(); error != cudaSuccess) return false;
         k_rebuild_occ_from_density<<<full_grid, block_x, 0, runtime.stream>>>(request.density_grid, cell_count, request.threshold, request.warmup_steps, request.update_interval, request.device_state, request.bitfield);
-        return ((cudaGetLastError()) == cudaSuccess);
+        return cudaGetLastError() == cudaSuccess;
     }
 
     static bool runtime_run_training_step(TrainRuntime& runtime, const TrainingStepRequest& request, const nerf::sampler::SampleBatchState& host_batch_state) {
@@ -2583,12 +2583,12 @@ namespace nerf::runtime {
         }
 
         runtime_accumulate_grad_stats(runtime);
-        if (((cudaGetLastError()) != cudaSuccess)) return false;
+        if (cudaGetLastError() != cudaSuccess) return false;
         k_finalize_training_stats<<<1, 1, 0, runtime.stream>>>(runtime.device_state, request.batch_state, runtime.workspace.loss_sum, runtime.workspace.grad_sumsq, runtime.workspace.nonfinite_flag);
-        if (((cudaGetLastError()) != cudaSuccess)) return false;
+        if (cudaGetLastError() != cudaSuccess) return false;
         if (!runtime_apply_optimizer(runtime, request.train_cfg)) return false;
         k_commit_training_step<<<1, 1, 0, runtime.stream>>>(runtime.device_state);
-        return ((cudaGetLastError()) == cudaSuccess);
+        return cudaGetLastError() == cudaSuccess;
     }
     static bool configure_training_plan(TrainRuntime& runtime, const OccupancyUpdateRequest& occupancy_request, const nerf::sampler::SamplerRequest& sampler_request, const TrainingStepRequest& training_request, const NerfTrainingConfig& config) {
         std::scoped_lock run_lock(runtime.run_mutex);
@@ -2600,7 +2600,7 @@ namespace nerf::runtime {
                             && runtime.plan.config.fixed_train_camera_idx == config.fixed_train_camera_idx;
         if (same_plan) return true;
 
-        if (((cudaStreamSynchronize(runtime.stream)) != cudaSuccess)) return false;
+        if (cudaStreamSynchronize(runtime.stream) != cudaSuccess) return false;
         const std::uint32_t occupancy_rows = occupancy_request.max_update_tiles * kTrainChunkRows;
         const std::uint32_t workspace_rows = std::max(training_request.max_sample_step_count + kNetworkBatchGranularity, occupancy_rows);
         if (!alloc_workspace(runtime.workspace, workspace_rows)) return false;
@@ -2639,16 +2639,16 @@ namespace nerf::runtime {
         if (!prepare_training_device_state(*runtime, camera_idx)) return false;
         if (!nerf::sampler::run_sampler(sampler_request)) return false;
         nerf::sampler::SampleBatchState host_batch_state{};
-        if (((cudaMemcpyAsync(&host_batch_state, sampler_request.batch_state, sizeof(nerf::sampler::SampleBatchState), cudaMemcpyDeviceToHost, runtime->stream)) != cudaSuccess)) return false;
-        if (((cudaStreamSynchronize(runtime->stream)) != cudaSuccess)) return false;
+        if (cudaMemcpyAsync(&host_batch_state, sampler_request.batch_state, sizeof(nerf::sampler::SampleBatchState), cudaMemcpyDeviceToHost, runtime->stream) != cudaSuccess) return false;
+        if (cudaStreamSynchronize(runtime->stream) != cudaSuccess) return false;
         if (host_batch_state.overflow != 0u) {
             if (!runtime_zero_network_gradients(*runtime)) return false;
             if (!runtime_zero_scalar_buffers(*runtime)) return false;
             k_finalize_training_stats<<<1, 1, 0, runtime->stream>>>(runtime->device_state, runtime->plan.training_request.batch_state, runtime->workspace.loss_sum, runtime->workspace.grad_sumsq, runtime->workspace.nonfinite_flag);
-            if (((cudaGetLastError()) != cudaSuccess)) return false;
+            if (cudaGetLastError() != cudaSuccess) return false;
             if (!runtime_apply_optimizer(*runtime, runtime->plan.training_request.train_cfg)) return false;
             k_commit_training_step<<<1, 1, 0, runtime->stream>>>(runtime->device_state);
-            if (((cudaGetLastError()) != cudaSuccess)) return false;
+            if (cudaGetLastError() != cudaSuccess) return false;
             ++runtime->host_frame_index;
             return true;
         }
@@ -2701,7 +2701,7 @@ NerfStatus nerf_create_context(const NerfCreateDesc* desc, void** out_context) {
     if (normalized.max_sample_steps == 0u) return NERF_STATUS_INVALID_ARGUMENT;
     if (normalized.max_batch_rays == 0u) return NERF_STATUS_INVALID_ARGUMENT;
     if (normalized.arena_alignment_bytes == 0u) return NERF_STATUS_INVALID_ARGUMENT;
-    if ((normalized.arena_alignment_bytes & (normalized.arena_alignment_bytes - 1u)) != 0u) return NERF_STATUS_INVALID_ARGUMENT;
+    if ((normalized.arena_alignment_bytes & normalized.arena_alignment_bytes - 1u) != 0u) return NERF_STATUS_INVALID_ARGUMENT;
 
     std::uint64_t cursor = 0u;
     Region occupancy_bitfield{};
@@ -2710,20 +2710,20 @@ NerfStatus nerf_create_context(const NerfCreateDesc* desc, void** out_context) {
     Region sample_steps{};
     Region sample_batch_state{};
 
-    std::uint64_t cell_count = static_cast<std::uint64_t>(normalized.occupancy_grid_res);
+    std::uint64_t cell_count = normalized.occupancy_grid_res;
     if (cell_count > std::numeric_limits<std::uint64_t>::max() / static_cast<std::uint64_t>(normalized.occupancy_grid_res)) return NERF_STATUS_OVERFLOW;
     cell_count *= static_cast<std::uint64_t>(normalized.occupancy_grid_res);
     if (cell_count > std::numeric_limits<std::uint64_t>::max() / static_cast<std::uint64_t>(normalized.occupancy_grid_res)) return NERF_STATUS_OVERFLOW;
     cell_count *= static_cast<std::uint64_t>(normalized.occupancy_grid_res);
 
-    const std::uint64_t bitfield_bytes = ((cell_count + 31u) / 32u) * sizeof(std::uint32_t);
+    const std::uint64_t bitfield_bytes = (cell_count + 31u) / 32u * sizeof(std::uint32_t);
     std::uint64_t density_bytes        = cell_count;
     if (density_bytes > std::numeric_limits<std::uint64_t>::max() / sizeof(float)) return NERF_STATUS_OVERFLOW;
     density_bytes *= sizeof(float);
 
     if (normalized.arena_alignment_bytes > 1u) {
         if (cursor > std::numeric_limits<std::uint64_t>::max() - (normalized.arena_alignment_bytes - 1u)) return NERF_STATUS_OVERFLOW;
-        cursor = (cursor + normalized.arena_alignment_bytes - 1u) & ~(normalized.arena_alignment_bytes - 1u);
+        cursor = cursor + normalized.arena_alignment_bytes - 1u & ~(normalized.arena_alignment_bytes - 1u);
     }
     occupancy_bitfield.offset_bytes = cursor;
     occupancy_bitfield.size_bytes   = bitfield_bytes;
@@ -2732,24 +2732,24 @@ NerfStatus nerf_create_context(const NerfCreateDesc* desc, void** out_context) {
 
     if (normalized.arena_alignment_bytes > 1u) {
         if (cursor > std::numeric_limits<std::uint64_t>::max() - (normalized.arena_alignment_bytes - 1u)) return NERF_STATUS_OVERFLOW;
-        cursor = (cursor + normalized.arena_alignment_bytes - 1u) & ~(normalized.arena_alignment_bytes - 1u);
+        cursor = cursor + normalized.arena_alignment_bytes - 1u & ~(normalized.arena_alignment_bytes - 1u);
     }
     occupancy_density.offset_bytes = cursor;
     occupancy_density.size_bytes   = density_bytes;
     if (cursor > std::numeric_limits<std::uint64_t>::max() - density_bytes) return NERF_STATUS_OVERFLOW;
     cursor += density_bytes;
 
-    std::uint64_t sample_ray_bytes = static_cast<std::uint64_t>(normalized.max_batch_rays);
+    std::uint64_t sample_ray_bytes = normalized.max_batch_rays;
     if (sample_ray_bytes > std::numeric_limits<std::uint64_t>::max() / sizeof(nerf::sampler::SampleRay)) return NERF_STATUS_OVERFLOW;
     sample_ray_bytes *= sizeof(nerf::sampler::SampleRay);
 
-    std::uint64_t sample_step_bytes = static_cast<std::uint64_t>(normalized.max_sample_steps);
+    std::uint64_t sample_step_bytes = normalized.max_sample_steps;
     if (sample_step_bytes > std::numeric_limits<std::uint64_t>::max() / sizeof(nerf::sampler::SampleStep)) return NERF_STATUS_OVERFLOW;
     sample_step_bytes *= sizeof(nerf::sampler::SampleStep);
 
     if (normalized.arena_alignment_bytes > 1u) {
         if (cursor > std::numeric_limits<std::uint64_t>::max() - (normalized.arena_alignment_bytes - 1u)) return NERF_STATUS_OVERFLOW;
-        cursor = (cursor + normalized.arena_alignment_bytes - 1u) & ~(normalized.arena_alignment_bytes - 1u);
+        cursor = cursor + normalized.arena_alignment_bytes - 1u & ~(normalized.arena_alignment_bytes - 1u);
     }
     sample_rays.offset_bytes = cursor;
     sample_rays.size_bytes   = sample_ray_bytes;
@@ -2758,7 +2758,7 @@ NerfStatus nerf_create_context(const NerfCreateDesc* desc, void** out_context) {
 
     if (normalized.arena_alignment_bytes > 1u) {
         if (cursor > std::numeric_limits<std::uint64_t>::max() - (normalized.arena_alignment_bytes - 1u)) return NERF_STATUS_OVERFLOW;
-        cursor = (cursor + normalized.arena_alignment_bytes - 1u) & ~(normalized.arena_alignment_bytes - 1u);
+        cursor = cursor + normalized.arena_alignment_bytes - 1u & ~(normalized.arena_alignment_bytes - 1u);
     }
     sample_steps.offset_bytes = cursor;
     sample_steps.size_bytes   = sample_step_bytes;
@@ -2767,7 +2767,7 @@ NerfStatus nerf_create_context(const NerfCreateDesc* desc, void** out_context) {
 
     if (normalized.arena_alignment_bytes > 1u) {
         if (cursor > std::numeric_limits<std::uint64_t>::max() - (normalized.arena_alignment_bytes - 1u)) return NERF_STATUS_OVERFLOW;
-        cursor = (cursor + normalized.arena_alignment_bytes - 1u) & ~(normalized.arena_alignment_bytes - 1u);
+        cursor = cursor + normalized.arena_alignment_bytes - 1u & ~(normalized.arena_alignment_bytes - 1u);
     }
     sample_batch_state.offset_bytes = cursor;
     sample_batch_state.size_bytes   = sizeof(nerf::sampler::SampleBatchState);
@@ -2856,7 +2856,7 @@ NerfStatus nerf_load_dataset(void* context, const NerfDatasetLoadDesc* desc, Ner
 
     if (ctx->arena_alignment_bytes > 1u) {
         if (cursor > std::numeric_limits<std::uint64_t>::max() - (ctx->arena_alignment_bytes - 1u)) return NERF_STATUS_OVERFLOW;
-        cursor = (cursor + ctx->arena_alignment_bytes - 1u) & ~(ctx->arena_alignment_bytes - 1u);
+        cursor = cursor + ctx->arena_alignment_bytes - 1u & ~(ctx->arena_alignment_bytes - 1u);
     }
     images.offset_bytes = cursor;
     images.size_bytes   = host_data.info.images_bytes;
@@ -2865,7 +2865,7 @@ NerfStatus nerf_load_dataset(void* context, const NerfDatasetLoadDesc* desc, Ner
 
     if (ctx->arena_alignment_bytes > 1u) {
         if (cursor > std::numeric_limits<std::uint64_t>::max() - (ctx->arena_alignment_bytes - 1u)) return NERF_STATUS_OVERFLOW;
-        cursor = (cursor + ctx->arena_alignment_bytes - 1u) & ~(ctx->arena_alignment_bytes - 1u);
+        cursor = cursor + ctx->arena_alignment_bytes - 1u & ~(ctx->arena_alignment_bytes - 1u);
     }
     xforms.offset_bytes = cursor;
     xforms.size_bytes   = host_data.info.c2w_bytes;
@@ -2885,14 +2885,14 @@ NerfStatus nerf_load_dataset(void* context, const NerfDatasetLoadDesc* desc, Ner
     ctx->xforms.ptr        = ctx->scene_device_base + xforms.offset_bytes;
     ctx->xforms.size_bytes = xforms.size_bytes;
 
-    if (cudaMemcpy(ctx->images.ptr, host_data.images_rgba8.data(), static_cast<std::size_t>(ctx->images.size_bytes), cudaMemcpyHostToDevice) != cudaSuccess) {
+    if (cudaMemcpy(ctx->images.ptr, host_data.images_rgba8.data(), ctx->images.size_bytes, cudaMemcpyHostToDevice) != cudaSuccess) {
         cudaFree(ctx->scene_device_base);
         ctx->scene_device_base = nullptr;
         ctx->images            = {};
         ctx->xforms            = {};
         return NERF_STATUS_CUDA_FAILURE;
     }
-    if (cudaMemcpy(ctx->xforms.ptr, host_data.c2w_4x4.data(), static_cast<std::size_t>(ctx->xforms.size_bytes), cudaMemcpyHostToDevice) != cudaSuccess) {
+    if (cudaMemcpy(ctx->xforms.ptr, host_data.c2w_4x4.data(), ctx->xforms.size_bytes, cudaMemcpyHostToDevice) != cudaSuccess) {
         cudaFree(ctx->scene_device_base);
         ctx->scene_device_base = nullptr;
         ctx->images            = {};
@@ -2943,7 +2943,7 @@ NerfStatus nerf_configure_training(void* context, const NerfTrainingConfig* conf
         .bitfield_bytes   = ctx->occupancy_bitfield.size_bytes,
         .density_grid     = reinterpret_cast<float*>(ctx->occupancy_density.ptr),
         .grid_res         = ctx->occupancy_grid_res,
-        .max_update_tiles = static_cast<std::uint32_t>((std::min<std::uint32_t>(normalized.occupancy_params.cells_per_update, occupancy_cell_count) + kTrainChunkRows - 1u) / kTrainChunkRows),
+        .max_update_tiles = ((std::min<std::uint32_t>(normalized.occupancy_params.cells_per_update, occupancy_cell_count) + kTrainChunkRows - 1u) / kTrainChunkRows),
         .decay            = normalized.occupancy_params.decay,
         .threshold        = normalized.occupancy_params.threshold,
         .cells_per_update = normalized.occupancy_params.cells_per_update,
@@ -3027,8 +3027,8 @@ NerfStatus nerf_save_network_weights(void* context, const NerfCheckpointFileDesc
     if (cudaStreamSynchronize(runtime->stream) != cudaSuccess) return NERF_STATUS_CUDA_FAILURE;
 
     nerf::host::HostCheckpointData checkpoint{};
-    checkpoint.density_params_f32.resize(static_cast<std::size_t>(runtime->network.density.params_f32.count));
-    checkpoint.color_params_f32.resize(static_cast<std::size_t>(runtime->network.color.params_f32.count));
+    checkpoint.density_params_f32.resize(runtime->network.density.params_f32.count);
+    checkpoint.color_params_f32.resize(runtime->network.color.params_f32.count);
     if (cudaMemcpy(checkpoint.density_params_f32.data(), runtime->network.density.params_f32.ptr, runtime->network.density.params_f32.bytes, cudaMemcpyDeviceToHost) != cudaSuccess) return NERF_STATUS_CUDA_FAILURE;
     if (cudaMemcpy(checkpoint.color_params_f32.data(), runtime->network.color.params_f32.ptr, runtime->network.color.params_f32.bytes, cudaMemcpyDeviceToHost) != cudaSuccess) return NERF_STATUS_CUDA_FAILURE;
     return nerf::io::save_network_checkpoint_file(*desc, layout, checkpoint);
