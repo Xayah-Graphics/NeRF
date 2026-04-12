@@ -38,10 +38,6 @@ namespace nerf::host {
     };
 } // namespace nerf::host
 
-namespace nerf::encoder {
-    bool run_encoder_module(cudaStream_t stream, const float* sample_inputs, std::uint32_t rows, float* encoded_pts, float* encoded_dir);
-} // namespace nerf::encoder
-
 
 namespace nerf::sampler {
     struct SampleRay {
@@ -100,7 +96,6 @@ namespace nerf::sampler {
         float3 aabb_max{};
     };
 
-    bool run_sampler(const SamplerRequest& request);
 } // namespace nerf::sampler
 
 
@@ -197,10 +192,6 @@ namespace nerf::network {
         std::uint32_t color_output_width    = 0u;
     };
 
-    bool init_network_module(NetworkSet& network_set, cudaStream_t stream);
-    bool describe_network_checkpoint_layout(const NetworkSet& network_set, NetworkCheckpointLayout& layout);
-    bool run_network_inference(NetworkSet& network_set, NetworkWorkspace& workspace, cudaStream_t stream, const NetworkInferenceRequest& request);
-    bool run_network_training(NetworkSet& network_set, NetworkWorkspace& workspace, cudaStream_t stream, const NetworkTrainingRequest& request);
 } // namespace nerf::network
 
 
@@ -1920,43 +1911,6 @@ namespace nerf::network {
 
 
 namespace nerf::runtime {
-    struct DeviceContext;
-}
-
-namespace {
-    struct Region {
-        std::uint64_t offset_bytes = 0u;
-        std::uint64_t size_bytes   = 0u;
-    };
-
-    struct DeviceSpan {
-        std::byte* ptr           = nullptr;
-        std::uint64_t size_bytes = 0u;
-    };
-
-    struct ContextStorage {
-        nerf::runtime::DeviceContext* cuda_context = nullptr;
-        std::byte* scratch_device_base             = nullptr;
-        std::byte* scene_device_base               = nullptr;
-        DeviceSpan images{};
-        DeviceSpan xforms{};
-        DeviceSpan occupancy_bitfield{};
-        DeviceSpan occupancy_density{};
-        DeviceSpan sample_rays{};
-        DeviceSpan sample_steps{};
-        DeviceSpan sample_batch_state{};
-        NerfDatasetInfo dataset_info{};
-        std::uint32_t occupancy_grid_res    = 0u;
-        std::uint32_t max_sample_steps      = 0u;
-        std::uint32_t max_batch_rays        = 0u;
-        std::uint64_t arena_alignment_bytes = 0u;
-        bool dataset_loaded                 = false;
-        bool training_configured            = false;
-        NerfTrainingConfig training_config{};
-    };
-} // namespace
-
-namespace nerf::runtime {
     struct TrainingDeviceState {
         std::uint32_t frame_index      = 0u;
         std::uint32_t optimizer_step   = 0u;
@@ -2653,6 +2607,39 @@ namespace nerf::runtime {
         return true;
     }
 } // namespace nerf::runtime
+
+namespace {
+    struct Region {
+        std::uint64_t offset_bytes = 0u;
+        std::uint64_t size_bytes   = 0u;
+    };
+
+    struct DeviceSpan {
+        std::byte* ptr           = nullptr;
+        std::uint64_t size_bytes = 0u;
+    };
+
+    struct ContextStorage {
+        nerf::runtime::DeviceContext* cuda_context = nullptr;
+        std::byte* scratch_device_base             = nullptr;
+        std::byte* scene_device_base               = nullptr;
+        DeviceSpan images{};
+        DeviceSpan xforms{};
+        DeviceSpan occupancy_bitfield{};
+        DeviceSpan occupancy_density{};
+        DeviceSpan sample_rays{};
+        DeviceSpan sample_steps{};
+        DeviceSpan sample_batch_state{};
+        NerfDatasetInfo dataset_info{};
+        std::uint32_t occupancy_grid_res    = 0u;
+        std::uint32_t max_sample_steps      = 0u;
+        std::uint32_t max_batch_rays        = 0u;
+        std::uint64_t arena_alignment_bytes = 0u;
+        bool dataset_loaded                 = false;
+        bool training_configured            = false;
+        NerfTrainingConfig training_config{};
+    };
+} // namespace
 
 extern "C" {
 NerfStatus nerf_create_context(const NerfCreateDesc* desc, void** out_context) {
