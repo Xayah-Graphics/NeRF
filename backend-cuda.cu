@@ -1153,7 +1153,6 @@ namespace nerf::sampler {
         k_sample_rays_flat<<<blocks, kSamplerBlockRays, 0, request.stream>>>(request.frame_index, request.camera_idx, request.cams, request.images, request.image_width, request.image_height, request.rays_per_batch, request.max_sample_steps_per_ray, request.max_sample_step_count, request.aabb_min, request.aabb_max, request.bitfield, request.occupancy_grid_res, request.sample_rays, request.sample_steps, request.batch_state);
         return cudaGetLastError() == cudaSuccess;
     }
-
 } // namespace nerf::sampler
 
 
@@ -1416,6 +1415,246 @@ namespace nerf::network {
                 fully_fused_hidden_backward(act_shmem, weights + weights_stride * (hidden_matmuls - layer - 1u), out_intermediate + layer_stride * (layer + 1u) + elem_idx_base * kFusedWidth, forward + layer_stride * (hidden_matmuls - layer - 1u) + elem_idx_base * kFusedWidth);
             }
         }
+
+        __global__ void k_compute_input_grad_prefix(const __half* __restrict__ weights, const __half* __restrict__ backprop, const std::uint32_t rows, const std::uint32_t input_width, const std::uint32_t output_width, const std::uint32_t prefix_width, __half* __restrict__ dinput) {
+            __shared__ __half weights_tile[32][16];
+            __shared__ __half backprop_tile[16][32];
+
+            const std::uint32_t input_col = blockIdx.x * 16u + threadIdx.x;
+            const std::uint32_t row       = blockIdx.y * 16u + threadIdx.y;
+            float sum                     = 0.0f;
+            const std::uint32_t tid       = threadIdx.y * blockDim.x + threadIdx.x;
+
+            for (std::uint32_t output_base = 0u; output_base < output_width; output_base += 32u) {
+                for (std::uint32_t idx = tid; idx < 32u * 16u; idx += blockDim.x * blockDim.y) {
+                    const std::uint32_t tile_out    = idx / 16u;
+                    const std::uint32_t tile_in     = idx - tile_out * 16u;
+                    const std::uint32_t global_out  = output_base + tile_out;
+                    const std::uint32_t global_in   = blockIdx.x * 16u + tile_in;
+                    weights_tile[tile_out][tile_in] = global_out < output_width && global_in < prefix_width ? weights[static_cast<std::uint64_t>(global_out) * input_width + global_in] : __float2half_rn(0.0f);
+                }
+                for (std::uint32_t idx = tid; idx < 16u * 32u; idx += blockDim.x * blockDim.y) {
+                    const std::uint32_t tile_row      = idx / 32u;
+                    const std::uint32_t tile_out      = idx - tile_row * 32u;
+                    const std::uint32_t global_row    = blockIdx.y * 16u + tile_row;
+                    const std::uint32_t global_out    = output_base + tile_out;
+                    backprop_tile[tile_row][tile_out] = global_row < rows && global_out < output_width ? backprop[static_cast<std::uint64_t>(global_row) * output_width + global_out] : __float2half_rn(0.0f);
+                }
+                __syncthreads();
+
+                if (row < rows && input_col < prefix_width) {
+#pragma unroll
+                    for (std::uint32_t tile_out = 0u; tile_out < 32u; ++tile_out) {
+                        sum += __half2float(backprop_tile[threadIdx.y][tile_out]) * __half2float(weights_tile[tile_out][threadIdx.x]);
+                    }
+                }
+                __syncthreads();
+            }
+
+            if (row < rows && input_col < prefix_width) {
+                dinput[static_cast<std::uint64_t>(row) * input_width + input_col] = __float2half_rn(sum);
+            }
+        }
+
+        __device__ __forceinline__ float sigmoid_raw(const float x) {
+            return 1.0f / (1.0f + __expf(-x));
+        }
+
+        __device__ __forceinline__ float softplus_sigma(const float x) {
+            if (x > 20.0f) return x;
+            if (x < -20.0f) return __expf(x);
+            return log1pf(__expf(x));
+        }
+
+        __global__ void k_pack_density_input(const float* __restrict__ encoded_pts, const std::uint32_t rows, const std::uint32_t padded_rows, __half* __restrict__ density_input) {
+            const std::uint32_t idx   = blockIdx.x * blockDim.x + threadIdx.x;
+            const std::uint32_t total = padded_rows * kDensityInputDim;
+            if (idx >= total) return;
+
+            const std::uint32_t row = idx / kDensityInputDim;
+            const std::uint32_t col = idx - row * kDensityInputDim;
+            float value             = 0.0f;
+            if (row < rows && col < kPtsInDim) value = encoded_pts[static_cast<std::uint64_t>(row) * kPtsInDim + col];
+            density_input[idx] = __float2half_rn(value);
+        }
+
+        __global__ void k_pack_color_input(const __half* __restrict__ density_output, const float* __restrict__ encoded_dir, const std::uint32_t rows, const std::uint32_t padded_rows, __half* __restrict__ color_input) {
+            const std::uint32_t idx   = blockIdx.x * blockDim.x + threadIdx.x;
+            const std::uint32_t total = padded_rows * kColorInputDim;
+            if (idx >= total) return;
+
+            const std::uint32_t row = idx / kColorInputDim;
+            const std::uint32_t col = idx - row * kColorInputDim;
+            float value             = 0.0f;
+            if (row < rows) {
+                if (col < kGeoFeatureDim) {
+                    value = __half2float(density_output[static_cast<std::uint64_t>(row) * kDensityOutputDim + 1u + col]);
+                } else if (col < kGeoFeatureDim + kDirInDim) {
+                    value = encoded_dir[static_cast<std::uint64_t>(row) * kDirInDim + (col - kGeoFeatureDim)];
+                }
+            }
+            color_input[idx] = __float2half_rn(value);
+        }
+
+        __global__ void k_pack_train_density_input(const nerf::sampler::SampleStep* __restrict__ sample_steps, const std::uint32_t rows, const std::uint32_t padded_rows, __half* __restrict__ density_input) {
+            const std::uint32_t idx   = blockIdx.x * blockDim.x + threadIdx.x;
+            const std::uint32_t total = padded_rows * kDensityInputDim;
+            if (idx >= total) return;
+
+            const std::uint32_t row = idx / kDensityInputDim;
+            const std::uint32_t col = idx - row * kDensityInputDim;
+            if (row >= rows) {
+                density_input[idx] = __float2half_rn(0.0f);
+                return;
+            }
+
+            const nerf::sampler::SampleStep sample = sample_steps[row];
+            if (col == 0u) {
+                density_input[idx] = __float2half_rn(sample.x);
+                return;
+            }
+            if (col == 1u) {
+                density_input[idx] = __float2half_rn(sample.y);
+                return;
+            }
+            if (col == 2u) {
+                density_input[idx] = __float2half_rn(sample.z);
+                return;
+            }
+
+            const std::uint32_t encoded_col = col - 3u;
+            const std::uint32_t level       = encoded_col / 6u;
+            const std::uint32_t lane        = encoded_col - level * 6u;
+            const float freq                = __uint2float_rn(1u << level);
+            const float px                  = sample.x * freq;
+            const float py                  = sample.y * freq;
+            const float pz                  = sample.z * freq;
+            float sx                        = 0.0f;
+            float cx                        = 0.0f;
+            float sy                        = 0.0f;
+            float cy                        = 0.0f;
+            float sz                        = 0.0f;
+            float cz                        = 0.0f;
+            __sincosf(px, &sx, &cx);
+            __sincosf(py, &sy, &cy);
+            __sincosf(pz, &sz, &cz);
+
+            float value = 0.0f;
+            switch (lane) {
+            case 0u: value = sx; break;
+            case 1u: value = sy; break;
+            case 2u: value = sz; break;
+            case 3u: value = cx; break;
+            case 4u: value = cy; break;
+            default: value = cz; break;
+            }
+            density_input[idx] = __float2half_rn(value);
+        }
+
+        __global__ void k_pack_train_color_input(const nerf::sampler::SampleStep* __restrict__ sample_steps, const __half* __restrict__ density_output, const std::uint32_t rows, const std::uint32_t padded_rows, __half* __restrict__ color_input) {
+            const std::uint32_t idx   = blockIdx.x * blockDim.x + threadIdx.x;
+            const std::uint32_t total = padded_rows * kColorInputDim;
+            if (idx >= total) return;
+
+            const std::uint32_t row = idx / kColorInputDim;
+            const std::uint32_t col = idx - row * kColorInputDim;
+            if (row >= rows) {
+                color_input[idx] = __float2half_rn(0.0f);
+                return;
+            }
+
+            if (col < kGeoFeatureDim) {
+                color_input[idx] = density_output[static_cast<std::uint64_t>(row) * kDensityOutputDim + 1u + col];
+                return;
+            }
+
+            const nerf::sampler::SampleStep sample = sample_steps[row];
+            if (col == kGeoFeatureDim + 0u) {
+                color_input[idx] = __float2half_rn(sample.dx);
+                return;
+            }
+            if (col == kGeoFeatureDim + 1u) {
+                color_input[idx] = __float2half_rn(sample.dy);
+                return;
+            }
+            if (col == kGeoFeatureDim + 2u) {
+                color_input[idx] = __float2half_rn(sample.dz);
+                return;
+            }
+
+            const std::uint32_t encoded_col = col - (kGeoFeatureDim + 3u);
+            const std::uint32_t level       = encoded_col / 6u;
+            const std::uint32_t lane        = encoded_col - level * 6u;
+            const float freq                = __uint2float_rn(1u << level);
+            const float dx                  = sample.dx * freq;
+            const float dy                  = sample.dy * freq;
+            const float dz                  = sample.dz * freq;
+            float sx                        = 0.0f;
+            float cx                        = 0.0f;
+            float sy                        = 0.0f;
+            float cy                        = 0.0f;
+            float sz                        = 0.0f;
+            float cz                        = 0.0f;
+            __sincosf(dx, &sx, &cx);
+            __sincosf(dy, &sy, &cy);
+            __sincosf(dz, &sz, &cz);
+
+            float value = 0.0f;
+            switch (lane) {
+            case 0u: value = sx; break;
+            case 1u: value = sy; break;
+            case 2u: value = sz; break;
+            case 3u: value = cx; break;
+            case 4u: value = cy; break;
+            default: value = cz; break;
+            }
+            color_input[idx] = __float2half_rn(value);
+        }
+
+        __global__ void k_unpack_network_outputs(const __half* __restrict__ density_output, const __half* __restrict__ color_output, const std::uint32_t rows, float* __restrict__ raw_rgb, float* __restrict__ raw_sigma) {
+            const std::uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+            if (idx >= rows) return;
+
+            raw_sigma[idx]                                         = __half2float(density_output[static_cast<std::uint64_t>(idx) * kDensityOutputDim]);
+            raw_rgb[static_cast<std::uint64_t>(idx) * 3ull + 0ull] = __half2float(color_output[static_cast<std::uint64_t>(idx) * kColorOutputPaddedDim + 0ull]);
+            raw_rgb[static_cast<std::uint64_t>(idx) * 3ull + 1ull] = __half2float(color_output[static_cast<std::uint64_t>(idx) * kColorOutputPaddedDim + 1ull]);
+            raw_rgb[static_cast<std::uint64_t>(idx) * 3ull + 2ull] = __half2float(color_output[static_cast<std::uint64_t>(idx) * kColorOutputPaddedDim + 2ull]);
+        }
+
+        __global__ void k_pack_color_output_grad(const float* __restrict__ d_rgb, const std::uint32_t rows, const std::uint32_t padded_rows, const float loss_scale, __half* __restrict__ color_doutput) {
+            const std::uint32_t idx   = blockIdx.x * blockDim.x + threadIdx.x;
+            const std::uint32_t total = padded_rows * kColorOutputPaddedDim;
+            if (idx >= total) return;
+
+            const std::uint32_t row = idx / kColorOutputPaddedDim;
+            const std::uint32_t col = idx - row * kColorOutputPaddedDim;
+            float value             = 0.0f;
+            if (row < rows && col < kColorOutputDim) value = d_rgb[static_cast<std::uint64_t>(row) * 3ull + col] * loss_scale;
+            color_doutput[idx] = __float2half_rn(value);
+        }
+
+        __global__ void k_pack_density_output_grad(const float* __restrict__ d_sigma, const __half* __restrict__ color_dinput, const std::uint32_t rows, const std::uint32_t padded_rows, const float loss_scale, __half* __restrict__ density_doutput) {
+            const std::uint32_t idx   = blockIdx.x * blockDim.x + threadIdx.x;
+            const std::uint32_t total = padded_rows * kDensityOutputDim;
+            if (idx >= total) return;
+
+            const std::uint32_t row = idx / kDensityOutputDim;
+            const std::uint32_t col = idx - row * kDensityOutputDim;
+            float value             = 0.0f;
+            if (row < rows) {
+                if (col == 0u)
+                    value = d_sigma[row] * loss_scale;
+                else
+                    value = __half2float(color_dinput[static_cast<std::uint64_t>(row) * kColorInputDim + (col - 1u)]);
+            }
+            density_doutput[idx] = __float2half_rn(value);
+        }
+
+        __global__ void k_accumulate_gradients_half(__half* dst, const __half* src, const std::uint32_t n) {
+            const std::uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+            if (idx >= n) return;
+            dst[idx] = __float2half_rn(__half2float(dst[idx]) + __half2float(src[idx]));
+        }
     } // namespace
 
     bool init_network_module(NetworkSet& network_set, cudaStream_t stream) {
@@ -1510,46 +1749,6 @@ namespace nerf::network {
         return cudaGetLastError() == cudaSuccess;
     }
 
-    __global__ void k_compute_input_grad_prefix(const __half* __restrict__ weights, const __half* __restrict__ backprop, const std::uint32_t rows, const std::uint32_t input_width, const std::uint32_t output_width, const std::uint32_t prefix_width, __half* __restrict__ dinput) {
-        __shared__ __half weights_tile[32][16];
-        __shared__ __half backprop_tile[16][32];
-
-        const std::uint32_t input_col = blockIdx.x * 16u + threadIdx.x;
-        const std::uint32_t row       = blockIdx.y * 16u + threadIdx.y;
-        float sum                     = 0.0f;
-        const std::uint32_t tid       = threadIdx.y * blockDim.x + threadIdx.x;
-
-        for (std::uint32_t output_base = 0u; output_base < output_width; output_base += 32u) {
-            for (std::uint32_t idx = tid; idx < 32u * 16u; idx += blockDim.x * blockDim.y) {
-                const std::uint32_t tile_out    = idx / 16u;
-                const std::uint32_t tile_in     = idx - tile_out * 16u;
-                const std::uint32_t global_out  = output_base + tile_out;
-                const std::uint32_t global_in   = blockIdx.x * 16u + tile_in;
-                weights_tile[tile_out][tile_in] = global_out < output_width && global_in < prefix_width ? weights[static_cast<std::uint64_t>(global_out) * input_width + global_in] : __float2half_rn(0.0f);
-            }
-            for (std::uint32_t idx = tid; idx < 16u * 32u; idx += blockDim.x * blockDim.y) {
-                const std::uint32_t tile_row      = idx / 32u;
-                const std::uint32_t tile_out      = idx - tile_row * 32u;
-                const std::uint32_t global_row    = blockIdx.y * 16u + tile_row;
-                const std::uint32_t global_out    = output_base + tile_out;
-                backprop_tile[tile_row][tile_out] = global_row < rows && global_out < output_width ? backprop[static_cast<std::uint64_t>(global_row) * output_width + global_out] : __float2half_rn(0.0f);
-            }
-            __syncthreads();
-
-            if (row < rows && input_col < prefix_width) {
-#pragma unroll
-                for (std::uint32_t tile_out = 0u; tile_out < 32u; ++tile_out) {
-                    sum += __half2float(backprop_tile[threadIdx.y][tile_out]) * __half2float(weights_tile[tile_out][threadIdx.x]);
-                }
-            }
-            __syncthreads();
-        }
-
-        if (row < rows && input_col < prefix_width) {
-            dinput[static_cast<std::uint64_t>(row) * input_width + input_col] = __float2half_rn(sum);
-        }
-    }
-
     static bool fully_fused_mlp_backward(const FusedNetworkState& network, void* blas_handle, cudaStream_t stream, const __half* input, const __half* doutput, std::uint32_t rows, const std::uint32_t dinput_prefix_width, __half* dinput, __half* backward_hidden, const __half* forward_hidden) {
         auto* handle = reinterpret_cast<cublasHandle_t>(blas_handle);
         if (handle == nullptr || network.params.ptr == nullptr || network.gradients_tmp.ptr == nullptr || input == nullptr || doutput == nullptr || forward_hidden == nullptr || backward_hidden == nullptr) return false;
@@ -1591,205 +1790,6 @@ namespace nerf::network {
         }
 
         return true;
-    }
-    __device__ __forceinline__ float sigmoid_raw(const float x) {
-        return 1.0f / (1.0f + __expf(-x));
-    }
-
-    __device__ __forceinline__ float softplus_sigma(const float x) {
-        if (x > 20.0f) return x;
-        if (x < -20.0f) return __expf(x);
-        return log1pf(__expf(x));
-    }
-
-    __global__ void k_pack_density_input(const float* __restrict__ encoded_pts, const std::uint32_t rows, const std::uint32_t padded_rows, __half* __restrict__ density_input) {
-        const std::uint32_t idx   = blockIdx.x * blockDim.x + threadIdx.x;
-        const std::uint32_t total = padded_rows * kDensityInputDim;
-        if (idx >= total) return;
-
-        const std::uint32_t row = idx / kDensityInputDim;
-        const std::uint32_t col = idx - row * kDensityInputDim;
-        float value             = 0.0f;
-        if (row < rows && col < kPtsInDim) value = encoded_pts[static_cast<std::uint64_t>(row) * kPtsInDim + col];
-        density_input[idx] = __float2half_rn(value);
-    }
-
-    __global__ void k_pack_color_input(const __half* __restrict__ density_output, const float* __restrict__ encoded_dir, const std::uint32_t rows, const std::uint32_t padded_rows, __half* __restrict__ color_input) {
-        const std::uint32_t idx   = blockIdx.x * blockDim.x + threadIdx.x;
-        const std::uint32_t total = padded_rows * kColorInputDim;
-        if (idx >= total) return;
-
-        const std::uint32_t row = idx / kColorInputDim;
-        const std::uint32_t col = idx - row * kColorInputDim;
-        float value             = 0.0f;
-        if (row < rows) {
-            if (col < kGeoFeatureDim) {
-                value = __half2float(density_output[static_cast<std::uint64_t>(row) * kDensityOutputDim + 1u + col]);
-            } else if (col < kGeoFeatureDim + kDirInDim) {
-                value = encoded_dir[static_cast<std::uint64_t>(row) * kDirInDim + (col - kGeoFeatureDim)];
-            }
-        }
-        color_input[idx] = __float2half_rn(value);
-    }
-
-    __global__ void k_pack_train_density_input(const nerf::sampler::SampleStep* __restrict__ sample_steps, const std::uint32_t rows, const std::uint32_t padded_rows, __half* __restrict__ density_input) {
-        const std::uint32_t idx   = blockIdx.x * blockDim.x + threadIdx.x;
-        const std::uint32_t total = padded_rows * kDensityInputDim;
-        if (idx >= total) return;
-
-        const std::uint32_t row = idx / kDensityInputDim;
-        const std::uint32_t col = idx - row * kDensityInputDim;
-        if (row >= rows) {
-            density_input[idx] = __float2half_rn(0.0f);
-            return;
-        }
-
-        const nerf::sampler::SampleStep sample = sample_steps[row];
-        if (col == 0u) {
-            density_input[idx] = __float2half_rn(sample.x);
-            return;
-        }
-        if (col == 1u) {
-            density_input[idx] = __float2half_rn(sample.y);
-            return;
-        }
-        if (col == 2u) {
-            density_input[idx] = __float2half_rn(sample.z);
-            return;
-        }
-
-        const std::uint32_t encoded_col = col - 3u;
-        const std::uint32_t level       = encoded_col / 6u;
-        const std::uint32_t lane        = encoded_col - level * 6u;
-        const float freq                = __uint2float_rn(1u << level);
-        const float px                  = sample.x * freq;
-        const float py                  = sample.y * freq;
-        const float pz                  = sample.z * freq;
-        float sx                        = 0.0f;
-        float cx                        = 0.0f;
-        float sy                        = 0.0f;
-        float cy                        = 0.0f;
-        float sz                        = 0.0f;
-        float cz                        = 0.0f;
-        __sincosf(px, &sx, &cx);
-        __sincosf(py, &sy, &cy);
-        __sincosf(pz, &sz, &cz);
-
-        float value = 0.0f;
-        switch (lane) {
-        case 0u: value = sx; break;
-        case 1u: value = sy; break;
-        case 2u: value = sz; break;
-        case 3u: value = cx; break;
-        case 4u: value = cy; break;
-        default: value = cz; break;
-        }
-        density_input[idx] = __float2half_rn(value);
-    }
-
-    __global__ void k_pack_train_color_input(const nerf::sampler::SampleStep* __restrict__ sample_steps, const __half* __restrict__ density_output, const std::uint32_t rows, const std::uint32_t padded_rows, __half* __restrict__ color_input) {
-        const std::uint32_t idx   = blockIdx.x * blockDim.x + threadIdx.x;
-        const std::uint32_t total = padded_rows * kColorInputDim;
-        if (idx >= total) return;
-
-        const std::uint32_t row = idx / kColorInputDim;
-        const std::uint32_t col = idx - row * kColorInputDim;
-        if (row >= rows) {
-            color_input[idx] = __float2half_rn(0.0f);
-            return;
-        }
-
-        if (col < kGeoFeatureDim) {
-            color_input[idx] = density_output[static_cast<std::uint64_t>(row) * kDensityOutputDim + 1u + col];
-            return;
-        }
-
-        const nerf::sampler::SampleStep sample = sample_steps[row];
-        if (col == kGeoFeatureDim + 0u) {
-            color_input[idx] = __float2half_rn(sample.dx);
-            return;
-        }
-        if (col == kGeoFeatureDim + 1u) {
-            color_input[idx] = __float2half_rn(sample.dy);
-            return;
-        }
-        if (col == kGeoFeatureDim + 2u) {
-            color_input[idx] = __float2half_rn(sample.dz);
-            return;
-        }
-
-        const std::uint32_t encoded_col = col - (kGeoFeatureDim + 3u);
-        const std::uint32_t level       = encoded_col / 6u;
-        const std::uint32_t lane        = encoded_col - level * 6u;
-        const float freq                = __uint2float_rn(1u << level);
-        const float dx                  = sample.dx * freq;
-        const float dy                  = sample.dy * freq;
-        const float dz                  = sample.dz * freq;
-        float sx                        = 0.0f;
-        float cx                        = 0.0f;
-        float sy                        = 0.0f;
-        float cy                        = 0.0f;
-        float sz                        = 0.0f;
-        float cz                        = 0.0f;
-        __sincosf(dx, &sx, &cx);
-        __sincosf(dy, &sy, &cy);
-        __sincosf(dz, &sz, &cz);
-
-        float value = 0.0f;
-        switch (lane) {
-        case 0u: value = sx; break;
-        case 1u: value = sy; break;
-        case 2u: value = sz; break;
-        case 3u: value = cx; break;
-        case 4u: value = cy; break;
-        default: value = cz; break;
-        }
-        color_input[idx] = __float2half_rn(value);
-    }
-
-    __global__ void k_unpack_network_outputs(const __half* __restrict__ density_output, const __half* __restrict__ color_output, const std::uint32_t rows, float* __restrict__ raw_rgb, float* __restrict__ raw_sigma) {
-        const std::uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-        if (idx >= rows) return;
-
-        raw_sigma[idx]                                         = __half2float(density_output[static_cast<std::uint64_t>(idx) * kDensityOutputDim]);
-        raw_rgb[static_cast<std::uint64_t>(idx) * 3ull + 0ull] = __half2float(color_output[static_cast<std::uint64_t>(idx) * kColorOutputPaddedDim + 0ull]);
-        raw_rgb[static_cast<std::uint64_t>(idx) * 3ull + 1ull] = __half2float(color_output[static_cast<std::uint64_t>(idx) * kColorOutputPaddedDim + 1ull]);
-        raw_rgb[static_cast<std::uint64_t>(idx) * 3ull + 2ull] = __half2float(color_output[static_cast<std::uint64_t>(idx) * kColorOutputPaddedDim + 2ull]);
-    }
-
-    __global__ void k_pack_color_output_grad(const float* __restrict__ d_rgb, const std::uint32_t rows, const std::uint32_t padded_rows, const float loss_scale, __half* __restrict__ color_doutput) {
-        const std::uint32_t idx   = blockIdx.x * blockDim.x + threadIdx.x;
-        const std::uint32_t total = padded_rows * kColorOutputPaddedDim;
-        if (idx >= total) return;
-
-        const std::uint32_t row = idx / kColorOutputPaddedDim;
-        const std::uint32_t col = idx - row * kColorOutputPaddedDim;
-        float value             = 0.0f;
-        if (row < rows && col < kColorOutputDim) value = d_rgb[static_cast<std::uint64_t>(row) * 3ull + col] * loss_scale;
-        color_doutput[idx] = __float2half_rn(value);
-    }
-
-    __global__ void k_pack_density_output_grad(const float* __restrict__ d_sigma, const __half* __restrict__ color_dinput, const std::uint32_t rows, const std::uint32_t padded_rows, const float loss_scale, __half* __restrict__ density_doutput) {
-        const std::uint32_t idx   = blockIdx.x * blockDim.x + threadIdx.x;
-        const std::uint32_t total = padded_rows * kDensityOutputDim;
-        if (idx >= total) return;
-
-        const std::uint32_t row = idx / kDensityOutputDim;
-        const std::uint32_t col = idx - row * kDensityOutputDim;
-        float value             = 0.0f;
-        if (row < rows) {
-            if (col == 0u)
-                value = d_sigma[row] * loss_scale;
-            else
-                value = __half2float(color_dinput[static_cast<std::uint64_t>(row) * kColorInputDim + (col - 1u)]);
-        }
-        density_doutput[idx] = __float2half_rn(value);
-    }
-
-    __global__ void k_accumulate_gradients_half(__half* dst, const __half* src, const std::uint32_t n) {
-        const std::uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-        if (idx >= n) return;
-        dst[idx] = __float2half_rn(__half2float(dst[idx]) + __half2float(src[idx]));
     }
 
     bool run_network_inference(NetworkSet& network_set, NetworkWorkspace& workspace, cudaStream_t stream, const NetworkInferenceRequest& request) {
@@ -2021,6 +2021,34 @@ namespace nerf::runtime {
         std::shared_ptr<TrainRuntime> train_runtime{};
     };
 
+    struct Region {
+        std::uint64_t offset_bytes = 0u;
+        std::uint64_t size_bytes   = 0u;
+    };
+
+    struct DeviceSpan {
+        std::byte* ptr           = nullptr;
+        std::uint64_t size_bytes = 0u;
+    };
+
+    struct ContextStorage {
+        DeviceContext* cuda_context = nullptr;
+        std::byte* scratch_device_base             = nullptr;
+        std::byte* scene_device_base               = nullptr;
+        DeviceSpan images{};
+        DeviceSpan xforms{};
+        DeviceSpan occupancy_bitfield{};
+        DeviceSpan occupancy_density{};
+        DeviceSpan sample_rays{};
+        DeviceSpan sample_steps{};
+        DeviceSpan sample_batch_state{};
+        NerfDatasetInfo dataset_info{};
+        std::uint32_t occupancy_grid_res    = 0u;
+        std::uint32_t max_sample_steps      = 0u;
+        std::uint32_t max_batch_rays        = 0u;
+        std::uint64_t arena_alignment_bytes = 0u;
+    };
+
 
     __host__ __device__ __forceinline__ std::uint32_t hash_u32(std::uint32_t x) {
         x ^= x >> 16u;
@@ -2121,6 +2149,96 @@ namespace nerf::runtime {
         adam_v[idx]     = v;
         params_f32[idx] = w;
         params[idx]     = __float2half_rn(w);
+    }
+
+    __global__ void k_prepare_update_density_grid(float* data, const std::uint32_t count, const float decay, const std::uint32_t update_interval, const std::uint32_t warmup_steps, const TrainingDeviceState* state) {
+        const std::uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+        if (idx >= count) return;
+        if (state->frame_index < warmup_steps)
+            data[idx] = 1.0f;
+        else if (state->frame_index == 0u || state->frame_index % update_interval == 0u)
+            data[idx] *= decay;
+    }
+
+    __global__ void k_prepare_occupancy_bitfield(std::uint32_t* bitfield, const std::uint32_t word_count, const std::uint32_t update_interval, const std::uint32_t warmup_steps, const TrainingDeviceState* state) {
+        const std::uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+        if (idx >= word_count) return;
+        if (state->frame_index < warmup_steps)
+            bitfield[idx] = 0xFFFFFFFFu;
+        else if (state->frame_index == 0u || state->frame_index % update_interval == 0u)
+            bitfield[idx] = 0u;
+    }
+
+    __global__ void k_build_occ_inputs(const TrainingDeviceState* state, const std::uint32_t total_rows, const std::uint32_t cells_per_update, const std::uint32_t cell_count, const std::uint32_t grid_res, const std::uint32_t warmup_steps, const std::uint32_t update_interval, const float3 aabb_min, const float3 aabb_max, float* out_inputs) {
+        const std::uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+        if (idx >= total_rows) return;
+
+        if (state->frame_index < warmup_steps || (state->frame_index >= warmup_steps && state->frame_index != 0u && state->frame_index % update_interval != 0u)) {
+            float* dst = out_inputs + static_cast<std::uint64_t>(idx) * 7ull;
+            dst[0]     = 0.0f;
+            dst[1]     = 0.0f;
+            dst[2]     = 0.0f;
+            dst[3]     = 0.0f;
+            dst[4]     = 0.0f;
+            dst[5]     = 0.0f;
+            dst[6]     = 1.0f;
+            return;
+        }
+        const std::uint32_t update_count = min(cells_per_update, cell_count);
+        const std::uint32_t linear_idx   = idx;
+        float* dst                       = out_inputs + static_cast<std::uint64_t>(idx) * 7ull;
+        if (linear_idx >= update_count) {
+            dst[0] = 0.0f;
+            dst[1] = 0.0f;
+            dst[2] = 0.0f;
+            dst[3] = 0.0f;
+            dst[4] = 0.0f;
+            dst[5] = 0.0f;
+            dst[6] = 1.0f;
+            return;
+        }
+
+        const std::uint32_t start_cell_base = static_cast<std::uint32_t>(static_cast<std::uint64_t>(state->frame_index) * update_count % cell_count);
+        const std::uint32_t cell            = (start_cell_base + linear_idx) % cell_count;
+        const std::uint32_t layer           = grid_res * grid_res;
+        const std::uint32_t z               = cell / layer;
+        const std::uint32_t rem             = cell - z * layer;
+        const std::uint32_t y               = rem / grid_res;
+        const std::uint32_t x               = rem - y * grid_res;
+        const float3 step                   = make_float3((aabb_max.x - aabb_min.x) / static_cast<float>(grid_res), (aabb_max.y - aabb_min.y) / static_cast<float>(grid_res), (aabb_max.z - aabb_min.z) / static_cast<float>(grid_res));
+        const float3 p                      = make_float3(aabb_min.x + (static_cast<float>(x) + 0.5f) * step.x, aabb_min.y + (static_cast<float>(y) + 0.5f) * step.y, aabb_min.z + (static_cast<float>(z) + 0.5f) * step.z);
+
+        dst[0] = p.x;
+        dst[1] = p.y;
+        dst[2] = p.z;
+        dst[3] = 0.0f;
+        dst[4] = 0.0f;
+        dst[5] = 0.0f;
+        dst[6] = 1.0f;
+    }
+
+    __global__ void k_update_density_from_sigma(float* density_grid, const float* raw_sigma, const TrainingDeviceState* state, const std::uint32_t total_rows, const std::uint32_t cells_per_update, const std::uint32_t cell_count, const std::uint32_t warmup_steps, const std::uint32_t update_interval) {
+        const std::uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+        if (idx >= total_rows) return;
+        if (state->frame_index < warmup_steps) return;
+        if (state->frame_index >= warmup_steps && state->frame_index != 0u && state->frame_index % update_interval != 0u) return;
+        const std::uint32_t update_count = min(cells_per_update, cell_count);
+        const std::uint32_t linear_idx   = idx;
+        if (linear_idx >= update_count) return;
+        const std::uint32_t start_cell_base = static_cast<std::uint32_t>(static_cast<std::uint64_t>(state->frame_index) * update_count % cell_count);
+        const std::uint32_t cell            = (start_cell_base + linear_idx) % cell_count;
+        const float sig_raw                 = raw_sigma[idx];
+        const float sigma                   = sig_raw > 20.0f ? sig_raw : sig_raw < -20.0f ? __expf(sig_raw) : log1pf(__expf(sig_raw));
+        density_grid[cell]                  = fmaxf(density_grid[cell], sigma);
+    }
+
+    __global__ void k_rebuild_occ_from_density(const float* density_grid, const std::uint32_t cell_count, const float threshold, const std::uint32_t warmup_steps, const std::uint32_t update_interval, const TrainingDeviceState* state, std::uint32_t* bitfield) {
+        const std::uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+        if (idx >= cell_count) return;
+        if (state->frame_index < warmup_steps) return;
+        if (state->frame_index >= warmup_steps && state->frame_index != 0u && state->frame_index % update_interval != 0u) return;
+        if (density_grid[idx] <= threshold) return;
+        atomicOr(&bitfield[idx >> 5u], 1u << (idx & 31u));
     }
 
     static void free_workspace(nerf::network::NetworkWorkspace& workspace) {
@@ -2365,127 +2483,7 @@ namespace nerf::runtime {
             return false;
         }
     }
-
-    __global__ void k_prepare_update_density_grid(float* data, const std::uint32_t count, const float decay, const std::uint32_t update_interval, const std::uint32_t warmup_steps, const TrainingDeviceState* state) {
-        const std::uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-        if (idx >= count) return;
-        if (state->frame_index < warmup_steps)
-            data[idx] = 1.0f;
-        else if (state->frame_index == 0u || state->frame_index % update_interval == 0u)
-            data[idx] *= decay;
-    }
-
-    __global__ void k_prepare_occupancy_bitfield(std::uint32_t* bitfield, const std::uint32_t word_count, const std::uint32_t update_interval, const std::uint32_t warmup_steps, const TrainingDeviceState* state) {
-        const std::uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-        if (idx >= word_count) return;
-        if (state->frame_index < warmup_steps)
-            bitfield[idx] = 0xFFFFFFFFu;
-        else if (state->frame_index == 0u || state->frame_index % update_interval == 0u)
-            bitfield[idx] = 0u;
-    }
-
-    __global__ void k_build_occ_inputs(const TrainingDeviceState* state, const std::uint32_t total_rows, const std::uint32_t cells_per_update, const std::uint32_t cell_count, const std::uint32_t grid_res, const std::uint32_t warmup_steps, const std::uint32_t update_interval, const float3 aabb_min, const float3 aabb_max, float* out_inputs) {
-        const std::uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-        if (idx >= total_rows) return;
-
-        if (state->frame_index < warmup_steps || (state->frame_index >= warmup_steps && state->frame_index != 0u && state->frame_index % update_interval != 0u)) {
-            float* dst = out_inputs + static_cast<std::uint64_t>(idx) * 7ull;
-            dst[0]     = 0.0f;
-            dst[1]     = 0.0f;
-            dst[2]     = 0.0f;
-            dst[3]     = 0.0f;
-            dst[4]     = 0.0f;
-            dst[5]     = 0.0f;
-            dst[6]     = 1.0f;
-            return;
-        }
-        const std::uint32_t update_count = min(cells_per_update, cell_count);
-        const std::uint32_t linear_idx   = idx;
-        float* dst                       = out_inputs + static_cast<std::uint64_t>(idx) * 7ull;
-        if (linear_idx >= update_count) {
-            dst[0] = 0.0f;
-            dst[1] = 0.0f;
-            dst[2] = 0.0f;
-            dst[3] = 0.0f;
-            dst[4] = 0.0f;
-            dst[5] = 0.0f;
-            dst[6] = 1.0f;
-            return;
-        }
-
-        const std::uint32_t start_cell_base = static_cast<std::uint32_t>(static_cast<std::uint64_t>(state->frame_index) * update_count % cell_count);
-        const std::uint32_t cell            = (start_cell_base + linear_idx) % cell_count;
-        const std::uint32_t layer           = grid_res * grid_res;
-        const std::uint32_t z               = cell / layer;
-        const std::uint32_t rem             = cell - z * layer;
-        const std::uint32_t y               = rem / grid_res;
-        const std::uint32_t x               = rem - y * grid_res;
-        const float3 step                   = make_float3((aabb_max.x - aabb_min.x) / static_cast<float>(grid_res), (aabb_max.y - aabb_min.y) / static_cast<float>(grid_res), (aabb_max.z - aabb_min.z) / static_cast<float>(grid_res));
-        const float3 p                      = make_float3(aabb_min.x + (static_cast<float>(x) + 0.5f) * step.x, aabb_min.y + (static_cast<float>(y) + 0.5f) * step.y, aabb_min.z + (static_cast<float>(z) + 0.5f) * step.z);
-
-        dst[0] = p.x;
-        dst[1] = p.y;
-        dst[2] = p.z;
-        dst[3] = 0.0f;
-        dst[4] = 0.0f;
-        dst[5] = 0.0f;
-        dst[6] = 1.0f;
-    }
-
-    __global__ void k_update_density_from_sigma(float* density_grid, const float* raw_sigma, const TrainingDeviceState* state, const std::uint32_t total_rows, const std::uint32_t cells_per_update, const std::uint32_t cell_count, const std::uint32_t warmup_steps, const std::uint32_t update_interval) {
-        const std::uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-        if (idx >= total_rows) return;
-        if (state->frame_index < warmup_steps) return;
-        if (state->frame_index >= warmup_steps && state->frame_index != 0u && state->frame_index % update_interval != 0u) return;
-        const std::uint32_t update_count = min(cells_per_update, cell_count);
-        const std::uint32_t linear_idx   = idx;
-        if (linear_idx >= update_count) return;
-        const std::uint32_t start_cell_base = static_cast<std::uint32_t>(static_cast<std::uint64_t>(state->frame_index) * update_count % cell_count);
-        const std::uint32_t cell            = (start_cell_base + linear_idx) % cell_count;
-        const float sig_raw                 = raw_sigma[idx];
-        const float sigma                   = sig_raw > 20.0f ? sig_raw : sig_raw < -20.0f ? __expf(sig_raw) : log1pf(__expf(sig_raw));
-        density_grid[cell]                  = fmaxf(density_grid[cell], sigma);
-    }
-
-    __global__ void k_rebuild_occ_from_density(const float* density_grid, const std::uint32_t cell_count, const float threshold, const std::uint32_t warmup_steps, const std::uint32_t update_interval, const TrainingDeviceState* state, std::uint32_t* bitfield) {
-        const std::uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-        if (idx >= cell_count) return;
-        if (state->frame_index < warmup_steps) return;
-        if (state->frame_index >= warmup_steps && state->frame_index != 0u && state->frame_index % update_interval != 0u) return;
-        if (density_grid[idx] <= threshold) return;
-        atomicOr(&bitfield[idx >> 5u], 1u << (idx & 31u));
-    }
 } // namespace nerf::runtime
-
-namespace {
-    struct Region {
-        std::uint64_t offset_bytes = 0u;
-        std::uint64_t size_bytes   = 0u;
-    };
-
-    struct DeviceSpan {
-        std::byte* ptr           = nullptr;
-        std::uint64_t size_bytes = 0u;
-    };
-
-    struct ContextStorage {
-        nerf::runtime::DeviceContext* cuda_context = nullptr;
-        std::byte* scratch_device_base             = nullptr;
-        std::byte* scene_device_base               = nullptr;
-        DeviceSpan images{};
-        DeviceSpan xforms{};
-        DeviceSpan occupancy_bitfield{};
-        DeviceSpan occupancy_density{};
-        DeviceSpan sample_rays{};
-        DeviceSpan sample_steps{};
-        DeviceSpan sample_batch_state{};
-        NerfDatasetInfo dataset_info{};
-        std::uint32_t occupancy_grid_res    = 0u;
-        std::uint32_t max_sample_steps      = 0u;
-        std::uint32_t max_batch_rays        = 0u;
-        std::uint64_t arena_alignment_bytes = 0u;
-    };
-} // namespace
 
 extern "C" {
 NerfStatus nerf_create_context(const NerfCreateDesc* desc, void** out_context) {
@@ -2499,8 +2497,8 @@ NerfStatus nerf_create_context(const NerfCreateDesc* desc, void** out_context) {
     if ((normalized.arena_alignment_bytes & normalized.arena_alignment_bytes - 1u) != 0u) return NERF_STATUS_INVALID_ARGUMENT;
 
     std::uint64_t cursor = 0u;
-    Region occupancy_bitfield{};
-    Region occupancy_density{};
+    nerf::runtime::Region occupancy_bitfield{};
+    nerf::runtime::Region occupancy_density{};
     {
         std::uint64_t cell_count = normalized.occupancy_grid_res;
         if (cell_count > std::numeric_limits<std::uint64_t>::max() / static_cast<std::uint64_t>(normalized.occupancy_grid_res)) return NERF_STATUS_OVERFLOW;
@@ -2532,9 +2530,9 @@ NerfStatus nerf_create_context(const NerfCreateDesc* desc, void** out_context) {
         cursor += density_bytes;
     }
 
-    Region sample_rays{};
-    Region sample_steps{};
-    Region sample_batch_state{};
+    nerf::runtime::Region sample_rays{};
+    nerf::runtime::Region sample_steps{};
+    nerf::runtime::Region sample_batch_state{};
     {
         std::uint64_t sample_ray_bytes = normalized.max_batch_rays;
         if (sample_ray_bytes > std::numeric_limits<std::uint64_t>::max() / sizeof(nerf::sampler::SampleRay)) return NERF_STATUS_OVERFLOW;
@@ -2573,7 +2571,7 @@ NerfStatus nerf_create_context(const NerfCreateDesc* desc, void** out_context) {
     }
 
     std::unique_ptr<nerf::runtime::DeviceContext> cuda_context = std::make_unique<nerf::runtime::DeviceContext>();
-    std::unique_ptr<ContextStorage> context                    = std::make_unique<ContextStorage>();
+    std::unique_ptr<nerf::runtime::ContextStorage> context                    = std::make_unique<nerf::runtime::ContextStorage>();
     context->cuda_context                                      = cuda_context.release();
     context->occupancy_grid_res                                = normalized.occupancy_grid_res;
     context->max_sample_steps                                  = normalized.max_sample_steps;
@@ -2621,7 +2619,7 @@ NerfStatus nerf_create_context(const NerfCreateDesc* desc, void** out_context) {
 NerfStatus nerf_destroy_context(void* context) {
     if (!context) return NERF_STATUS_OK;
 
-    const std::unique_ptr<ContextStorage> owned{static_cast<ContextStorage*>(context)};
+    const std::unique_ptr<nerf::runtime::ContextStorage> owned{static_cast<nerf::runtime::ContextStorage*>(context)};
     NerfStatus status = NERF_STATUS_OK;
 
     if (owned->cuda_context) {
@@ -2655,11 +2653,10 @@ NerfStatus nerf_load_dataset(void* context, const NerfDatasetLoadDesc* desc, Ner
     const NerfStatus load_status = nerf::io::load_dataset_host_data(*desc, host_data);
     if (load_status != NERF_STATUS_OK) return load_status;
 
-    ContextStorage* ctx = static_cast<ContextStorage*>(context);
-    std::shared_ptr<nerf::runtime::TrainRuntime> runtime;
+    nerf::runtime::ContextStorage* ctx = static_cast<nerf::runtime::ContextStorage*>(context);
     {
         std::scoped_lock lock(ctx->cuda_context->train_runtime_mutex);
-        runtime                      = ctx->cuda_context->train_runtime;
+        std::shared_ptr<nerf::runtime::TrainRuntime> runtime = ctx->cuda_context->train_runtime;
         runtime->training_configured = false;
         runtime->host_frame_index    = 0u;
     }
@@ -2670,8 +2667,8 @@ NerfStatus nerf_load_dataset(void* context, const NerfDatasetLoadDesc* desc, Ner
     }
 
     std::uint64_t cursor = 0u;
-    Region images{};
-    Region xforms{};
+    nerf::runtime::Region images{};
+    nerf::runtime::Region xforms{};
     {
         if (ctx->arena_alignment_bytes > 1u) {
             if (cursor > std::numeric_limits<std::uint64_t>::max() - (ctx->arena_alignment_bytes - 1u)) return NERF_STATUS_OVERFLOW;
@@ -2737,7 +2734,7 @@ NerfStatus nerf_configure_training(void* context, const NerfTrainingConfig* conf
     if (normalized.max_sample_steps_per_ray == 0u) return NERF_STATUS_INVALID_ARGUMENT;
     if (normalized.max_sample_steps_per_ray > kMaxSampleStepsPerRay) return NERF_STATUS_RANGE_ERROR;
 
-    ContextStorage* ctx = static_cast<ContextStorage*>(context);
+    nerf::runtime::ContextStorage* ctx = static_cast<nerf::runtime::ContextStorage*>(context);
     std::shared_ptr<nerf::runtime::TrainRuntime> runtime;
     {
         std::scoped_lock lock(ctx->cuda_context->train_runtime_mutex);
@@ -2822,7 +2819,7 @@ NerfStatus nerf_configure_training(void* context, const NerfTrainingConfig* conf
 NerfStatus nerf_train_step(void* context) {
     if (!context) return NERF_STATUS_INVALID_ARGUMENT;
 
-    const ContextStorage* ctx = static_cast<ContextStorage*>(context);
+    const nerf::runtime::ContextStorage* ctx = static_cast<nerf::runtime::ContextStorage*>(context);
     std::shared_ptr<nerf::runtime::TrainRuntime> runtime;
     {
         std::scoped_lock lock(ctx->cuda_context->train_runtime_mutex);
@@ -2929,7 +2926,7 @@ NerfStatus nerf_train_step(void* context) {
 
 NerfStatus nerf_read_train_stats(void* context, NerfTrainStats* out_stats) {
     if (!context || !out_stats) return NERF_STATUS_INVALID_ARGUMENT;
-    const ContextStorage* ctx = static_cast<ContextStorage*>(context);
+    const nerf::runtime::ContextStorage* ctx = static_cast<nerf::runtime::ContextStorage*>(context);
 
     std::shared_ptr<nerf::runtime::TrainRuntime> runtime;
     {
@@ -2947,7 +2944,7 @@ NerfStatus nerf_read_train_stats(void* context, NerfTrainStats* out_stats) {
 NerfStatus nerf_save_network_weights(void* context, const NerfCheckpointFileDesc* desc) {
     if (!context || !desc || !desc->path_utf8) return NERF_STATUS_INVALID_ARGUMENT;
 
-    const ContextStorage* ctx = static_cast<ContextStorage*>(context);
+    const nerf::runtime::ContextStorage* ctx = static_cast<nerf::runtime::ContextStorage*>(context);
     std::shared_ptr<nerf::runtime::TrainRuntime> runtime;
     {
         std::scoped_lock lock(ctx->cuda_context->train_runtime_mutex);
@@ -2970,7 +2967,7 @@ NerfStatus nerf_save_network_weights(void* context, const NerfCheckpointFileDesc
 NerfStatus nerf_load_network_weights(void* context, const NerfCheckpointFileDesc* desc) {
     if (!context || !desc || !desc->path_utf8) return NERF_STATUS_INVALID_ARGUMENT;
 
-    const ContextStorage* ctx = static_cast<ContextStorage*>(context);
+    const nerf::runtime::ContextStorage* ctx = static_cast<nerf::runtime::ContextStorage*>(context);
     std::shared_ptr<nerf::runtime::TrainRuntime> runtime;
     {
         std::scoped_lock lock(ctx->cuda_context->train_runtime_mutex);
