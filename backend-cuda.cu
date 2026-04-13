@@ -2853,27 +2853,29 @@ NerfStatus nerf_load_dataset(void* context, const NerfDatasetLoadDesc* desc, Ner
         if (cudaFree(ctx->scene_device_base) != cudaSuccess) return NERF_STATUS_CUDA_FAILURE;
         ctx->scene_device_base = nullptr;
     }
+
     std::uint64_t cursor = 0u;
     Region images{};
     Region xforms{};
+    {
+        if (ctx->arena_alignment_bytes > 1u) {
+            if (cursor > std::numeric_limits<std::uint64_t>::max() - (ctx->arena_alignment_bytes - 1u)) return NERF_STATUS_OVERFLOW;
+            cursor = cursor + ctx->arena_alignment_bytes - 1u & ~(ctx->arena_alignment_bytes - 1u);
+        }
+        images.offset_bytes = cursor;
+        images.size_bytes   = host_data.info.images_bytes;
+        if (cursor > std::numeric_limits<std::uint64_t>::max() - images.size_bytes) return NERF_STATUS_OVERFLOW;
+        cursor += images.size_bytes;
 
-    if (ctx->arena_alignment_bytes > 1u) {
-        if (cursor > std::numeric_limits<std::uint64_t>::max() - (ctx->arena_alignment_bytes - 1u)) return NERF_STATUS_OVERFLOW;
-        cursor = cursor + ctx->arena_alignment_bytes - 1u & ~(ctx->arena_alignment_bytes - 1u);
+        if (ctx->arena_alignment_bytes > 1u) {
+            if (cursor > std::numeric_limits<std::uint64_t>::max() - (ctx->arena_alignment_bytes - 1u)) return NERF_STATUS_OVERFLOW;
+            cursor = cursor + ctx->arena_alignment_bytes - 1u & ~(ctx->arena_alignment_bytes - 1u);
+        }
+        xforms.offset_bytes = cursor;
+        xforms.size_bytes   = host_data.info.c2w_bytes;
+        if (cursor > std::numeric_limits<std::uint64_t>::max() - xforms.size_bytes) return NERF_STATUS_OVERFLOW;
+        cursor += xforms.size_bytes;
     }
-    images.offset_bytes = cursor;
-    images.size_bytes   = host_data.info.images_bytes;
-    if (cursor > std::numeric_limits<std::uint64_t>::max() - images.size_bytes) return NERF_STATUS_OVERFLOW;
-    cursor += images.size_bytes;
-
-    if (ctx->arena_alignment_bytes > 1u) {
-        if (cursor > std::numeric_limits<std::uint64_t>::max() - (ctx->arena_alignment_bytes - 1u)) return NERF_STATUS_OVERFLOW;
-        cursor = cursor + ctx->arena_alignment_bytes - 1u & ~(ctx->arena_alignment_bytes - 1u);
-    }
-    xforms.offset_bytes = cursor;
-    xforms.size_bytes   = host_data.info.c2w_bytes;
-    if (cursor > std::numeric_limits<std::uint64_t>::max() - xforms.size_bytes) return NERF_STATUS_OVERFLOW;
-    cursor += xforms.size_bytes;
 
     void* scene_ptr                = nullptr;
     const cudaError_t alloc_status = cudaMalloc(&scene_ptr, cursor);
