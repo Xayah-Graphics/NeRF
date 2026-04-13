@@ -164,31 +164,41 @@ namespace nerf::network {
         std::size_t bytes   = 0u;
     };
 
+    struct AdamStepScalars {
+        float learning_rate        = 0.0f;
+        float grad_scale           = 1.0f;
+        float inv_bias_correction1 = 1.0f;
+        float inv_bias_correction2 = 1.0f;
+        float inv_loss_scale       = 1.0f;
+        std::uint32_t skip_update  = 0u;
+    };
+
     struct NetworkWorkspace {
-        std::uint32_t rows_capacity     = 0u;
-        unsigned char* arena            = nullptr;
-        float* inputs_tmp               = nullptr;
-        float* enc_pts                  = nullptr;
-        float* enc_dir                  = nullptr;
-        float* raw_rgb                  = nullptr;
-        float* d_rgb                    = nullptr;
-        float* raw_sigma                = nullptr;
-        float* d_sigma                  = nullptr;
-        float* trans_tmp                = nullptr;
-        float* loss_sum                 = nullptr;
-        float* grad_sumsq               = nullptr;
-        std::uint32_t* nonfinite_flag   = nullptr;
-        __half* density_input           = nullptr;
-        __half* density_output          = nullptr;
-        __half* density_doutput         = nullptr;
-        __half* density_forward_hidden  = nullptr;
-        __half* density_backward_hidden = nullptr;
-        __half* color_input             = nullptr;
-        __half* color_output            = nullptr;
-        __half* color_doutput           = nullptr;
-        __half* color_dinput            = nullptr;
-        __half* color_forward_hidden    = nullptr;
-        __half* color_backward_hidden   = nullptr;
+        std::uint32_t rows_capacity        = 0u;
+        unsigned char* arena               = nullptr;
+        float* inputs_tmp                  = nullptr;
+        float* enc_pts                     = nullptr;
+        float* enc_dir                     = nullptr;
+        float* raw_rgb                     = nullptr;
+        float* d_rgb                       = nullptr;
+        float* raw_sigma                   = nullptr;
+        float* d_sigma                     = nullptr;
+        float* trans_tmp                   = nullptr;
+        float* loss_sum                    = nullptr;
+        float* grad_sumsq                  = nullptr;
+        std::uint32_t* nonfinite_flag      = nullptr;
+        AdamStepScalars* adam_step_scalars = nullptr;
+        __half* density_input              = nullptr;
+        __half* density_output             = nullptr;
+        __half* density_doutput            = nullptr;
+        __half* density_forward_hidden     = nullptr;
+        __half* density_backward_hidden    = nullptr;
+        __half* color_input                = nullptr;
+        __half* color_output               = nullptr;
+        __half* color_doutput              = nullptr;
+        __half* color_dinput               = nullptr;
+        __half* color_forward_hidden       = nullptr;
+        __half* color_backward_hidden      = nullptr;
     };
 
     struct FusedNetworkState {
@@ -2209,26 +2219,51 @@ namespace nerf::runtime {
         ++state->frame_index;
     }
 
-    __global__ void k_adam_step_half(float* params_f32, __half* params, const __half* grads, float* adam_m, float* adam_v, const std::uint32_t n, const float base_learning_rate, const float beta1, const float beta2, const float epsilon, const std::uint32_t lr_decay_ksteps, const float inv_loss_scale, const TrainingDeviceState* state) {
+    __global__ void k_prepare_adam_step_scalars(const TrainingDeviceState* state, const float base_learning_rate, const float beta1, const float beta2, const std::uint32_t lr_decay_ksteps, const float inv_loss_scale, nerf::network::AdamStepScalars* out) {
+        if (blockIdx.x != 0u || threadIdx.x != 0u) return;
+
+        const float grad_norm              = state->stats.grad_norm;
+        const std::uint32_t has_nonfinite  = state->stats.has_nonfinite;
+        const std::uint32_t optimizer_step = state->optimizer_step;
+        const bool skip_update             = has_nonfinite != 0u || !isfinite(grad_norm) || grad_norm > kUpdateGuardGradNorm;
+
+        float learning_rate        = 0.0f;
+        float grad_scale           = 1.0f;
+        float inv_bias_correction1 = 1.0f;
+        float inv_bias_correction2 = 1.0f;
+
+        if (!skip_update) {
+            const float decay    = static_cast<float>(lr_decay_ksteps) * 1000.0f;
+            learning_rate        = decay > 0.0f ? base_learning_rate * powf(0.1f, static_cast<float>(optimizer_step) / decay) : base_learning_rate;
+            grad_scale           = grad_norm > kGlobalGradClipNorm && grad_norm > 0.0f ? kGlobalGradClipNorm / grad_norm : 1.0f;
+            inv_bias_correction1 = 1.0f / (1.0f - powf(beta1, static_cast<float>(optimizer_step)));
+            inv_bias_correction2 = 1.0f / (1.0f - powf(beta2, static_cast<float>(optimizer_step)));
+        }
+
+        out->learning_rate        = learning_rate;
+        out->grad_scale           = grad_scale;
+        out->inv_bias_correction1 = inv_bias_correction1;
+        out->inv_bias_correction2 = inv_bias_correction2;
+        out->inv_loss_scale       = inv_loss_scale;
+        out->skip_update          = skip_update ? 1u : 0u;
+    }
+
+    __global__ void k_adam_step_half(float* params_f32, __half* params, const __half* grads, float* adam_m, float* adam_v, const std::uint32_t n, const float beta1, const float beta2, const float epsilon, const nerf::network::AdamStepScalars* step_scalars) {
         const std::uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
         if (idx >= n) return;
 
-        const float grad_norm             = state->stats.grad_norm;
-        const std::uint32_t has_nonfinite = state->stats.has_nonfinite;
-        const bool skip_update            = has_nonfinite != 0u || !isfinite(grad_norm) || grad_norm > kUpdateGuardGradNorm;
-        if (skip_update) return;
+        __shared__ nerf::network::AdamStepScalars shared_step;
+        if (threadIdx.x == 0u) shared_step = *step_scalars;
+        __syncthreads();
 
-        const float decay                = static_cast<float>(lr_decay_ksteps) * 1000.0f;
-        const float learning_rate        = decay > 0.0f ? base_learning_rate * powf(0.1f, static_cast<float>(state->optimizer_step) / decay) : base_learning_rate;
-        const float grad_scale           = grad_norm > kGlobalGradClipNorm && grad_norm > 0.0f ? kGlobalGradClipNorm / grad_norm : 1.0f;
-        const float inv_bias_correction1 = 1.0f / (1.0f - powf(beta1, static_cast<float>(state->optimizer_step)));
-        const float inv_bias_correction2 = 1.0f / (1.0f - powf(beta2, static_cast<float>(state->optimizer_step)));
-        const float grad                 = __half2float(grads[idx]) * inv_loss_scale;
-        const float scaled_grad          = grad * grad_scale;
-        const float m                    = beta1 * adam_m[idx] + (1.0f - beta1) * scaled_grad;
-        const float v                    = beta2 * adam_v[idx] + (1.0f - beta2) * scaled_grad * scaled_grad;
-        const float step                 = learning_rate * (m * inv_bias_correction1) / (sqrtf(v * inv_bias_correction2) + epsilon);
-        const float w                    = params_f32[idx] - step;
+        if (shared_step.skip_update != 0u) return;
+
+        const float grad        = __half2float(grads[idx]) * shared_step.inv_loss_scale;
+        const float scaled_grad = grad * shared_step.grad_scale;
+        const float m           = beta1 * adam_m[idx] + (1.0f - beta1) * scaled_grad;
+        const float v           = beta2 * adam_v[idx] + (1.0f - beta2) * scaled_grad * scaled_grad;
+        const float step        = shared_step.learning_rate * (m * shared_step.inv_bias_correction1) / (sqrtf(v * shared_step.inv_bias_correction2) + epsilon);
+        const float w           = params_f32[idx] - step;
 
         adam_m[idx]     = m;
         adam_v[idx]     = v;
@@ -2376,6 +2411,7 @@ namespace nerf::runtime {
         reserve(sizeof(float));
         reserve(sizeof(float));
         reserve(sizeof(std::uint32_t));
+        reserve(sizeof(nerf::network::AdamStepScalars));
         reserve(row_count * kDensityInputDim * sizeof(__half));
         reserve(row_count * kDensityOutputDim * sizeof(__half));
         reserve(row_count * kDensityOutputDim * sizeof(__half));
@@ -2408,6 +2444,7 @@ namespace nerf::runtime {
         place(workspace.loss_sum, sizeof(float));
         place(workspace.grad_sumsq, sizeof(float));
         place(workspace.nonfinite_flag, sizeof(std::uint32_t));
+        place(workspace.adam_step_scalars, sizeof(nerf::network::AdamStepScalars));
         place(workspace.density_input, row_count * kDensityInputDim * sizeof(__half));
         place(workspace.density_output, row_count * kDensityOutputDim * sizeof(__half));
         place(workspace.density_doutput, row_count * kDensityOutputDim * sizeof(__half));
@@ -2992,15 +3029,16 @@ NerfStatus nerf_train_step(void* context) {
         if (!(beta1 >= 0.0f && beta1 < 1.0f && beta2 >= 0.0f && beta2 < 1.0f && epsilon > 0.0f && std::isfinite(epsilon))) return NERF_STATUS_INTERNAL_ERROR;
 
         constexpr std::uint32_t threads = kThreads256;
-        constexpr float inv_loss_scale  = kInvLossScale;
-        const std::uint32_t density_n   = static_cast<std::uint32_t>(runtime->network.density.gradients.count);
-        const std::uint32_t color_n     = static_cast<std::uint32_t>(runtime->network.color.gradients.count);
+        nerf::runtime::k_prepare_adam_step_scalars<<<1, 1, 0, runtime->stream>>>(runtime->device_state, runtime->training_request.train_cfg.learning_rate, beta1, beta2, runtime->training_request.train_cfg.lr_decay_ksteps, kInvLossScale, runtime->workspace.adam_step_scalars);
+        if (cudaGetLastError() != cudaSuccess) return NERF_STATUS_INTERNAL_ERROR;
+
+        const std::uint32_t density_n = static_cast<std::uint32_t>(runtime->network.density.gradients.count);
+        const std::uint32_t color_n   = static_cast<std::uint32_t>(runtime->network.color.gradients.count);
         if (density_n != 0u) {
-            nerf::runtime::k_adam_step_half<<<(density_n + threads - 1u) / threads, threads, 0, runtime->stream>>>(
-                runtime->network.density.params_f32.ptr, runtime->network.density.params.ptr, runtime->network.density.gradients.ptr, runtime->network.density.adam_m.ptr, runtime->network.density.adam_v.ptr, density_n, runtime->training_request.train_cfg.learning_rate, beta1, beta2, epsilon, runtime->training_request.train_cfg.lr_decay_ksteps, inv_loss_scale, runtime->device_state);
+            nerf::runtime::k_adam_step_half<<<(density_n + threads - 1u) / threads, threads, 0, runtime->stream>>>(runtime->network.density.params_f32.ptr, runtime->network.density.params.ptr, runtime->network.density.gradients.ptr, runtime->network.density.adam_m.ptr, runtime->network.density.adam_v.ptr, density_n, beta1, beta2, epsilon, runtime->workspace.adam_step_scalars);
         }
         if (color_n != 0u) {
-            nerf::runtime::k_adam_step_half<<<(color_n + threads - 1u) / threads, threads, 0, runtime->stream>>>(runtime->network.color.params_f32.ptr, runtime->network.color.params.ptr, runtime->network.color.gradients.ptr, runtime->network.color.adam_m.ptr, runtime->network.color.adam_v.ptr, color_n, runtime->training_request.train_cfg.learning_rate, beta1, beta2, epsilon, runtime->training_request.train_cfg.lr_decay_ksteps, inv_loss_scale, runtime->device_state);
+            nerf::runtime::k_adam_step_half<<<(color_n + threads - 1u) / threads, threads, 0, runtime->stream>>>(runtime->network.color.params_f32.ptr, runtime->network.color.params.ptr, runtime->network.color.gradients.ptr, runtime->network.color.adam_m.ptr, runtime->network.color.adam_v.ptr, color_n, beta1, beta2, epsilon, runtime->workspace.adam_step_scalars);
         }
         if (cudaGetLastError() != cudaSuccess) return NERF_STATUS_INTERNAL_ERROR;
     }
