@@ -14,19 +14,12 @@ constexpr std::uint32_t kDefaultRays           = 4096u;
 constexpr std::uint32_t kDefaultMaxSampleSteps = 64u;
 constexpr std::uint32_t kDefaultLogInterval    = 200u;
 
-enum class CameraMode : std::uint8_t {
-    cycle  = 0u,
-    fixed  = 1u,
-    ramdom = 2u,
-};
-
 enum class CliKey : std::uint8_t {
     dataset,
     steps,
     rays,
     max_sample_steps,
     log_interval,
-    camera,
     load_weights,
     save_weights,
     help,
@@ -40,8 +33,6 @@ int main(int argc, char** argv) {
         std::uint32_t rays_per_batch           = kDefaultRays;
         std::uint32_t max_sample_steps_per_ray = kDefaultMaxSampleSteps;
         std::uint32_t log_interval             = kDefaultLogInterval;
-        CameraMode camera_mode                 = CameraMode::ramdom;
-        std::uint32_t camera_fixed_i           = 0u;
         NerfVec3 aabb_min{0.0f, 0.0f, 0.0f};
         NerfVec3 aabb_max{1.0f, 1.0f, 1.0f};
         std::filesystem::path load_weights_path{};
@@ -54,13 +45,12 @@ int main(int argc, char** argv) {
         bool needs_value = false;
     };
 
-    constexpr std::array<CliOptionDesc, 8> cli_desc{{
+    constexpr std::array<CliOptionDesc, 7> cli_desc{{
         {.name = "--dataset", .key = CliKey::dataset, .needs_value = true},
         {.name = "--steps", .key = CliKey::steps, .needs_value = true},
         {.name = "--rays", .key = CliKey::rays, .needs_value = true},
         {.name = "--max-sample-steps", .key = CliKey::max_sample_steps, .needs_value = true},
         {.name = "--log-interval", .key = CliKey::log_interval, .needs_value = true},
-        {.name = "--camera", .key = CliKey::camera, .needs_value = true},
         {.name = "--load-weights", .key = CliKey::load_weights, .needs_value = true},
         {.name = "--save-weights", .key = CliKey::save_weights, .needs_value = true},
     }};
@@ -84,7 +74,6 @@ int main(int argc, char** argv) {
             std::cout << "  --rays <N> default " << config.rays_per_batch << '\n';
             std::cout << "  --max-sample-steps <N> default " << config.max_sample_steps_per_ray << '\n';
             std::cout << "  --log-interval <N> default " << config.log_interval << '\n';
-            std::cout << "  --camera <idx> default -1 (cycle cameras)\n";
             std::cout << "  --load-weights <path> optional\n";
             std::cout << "  --save-weights <path> optional\n";
             return 0;
@@ -144,23 +133,6 @@ int main(int argc, char** argv) {
                     return 2;
                 }
                 config.log_interval = static_cast<std::uint32_t>(parsed);
-                break;
-            }
-        case CliKey::camera:
-            {
-                std::int64_t parsed  = 0;
-                const auto [ptr, ec] = std::from_chars(value.data(), value.data() + value.size(), parsed);
-                if (ec != std::errc{} || ptr != value.data() + value.size()) {
-                    std::cerr << "invalid value for --camera: " << value << '\n';
-                    return 2;
-                }
-                if (parsed >= 0) {
-                    config.camera_mode    = CameraMode::fixed;
-                    config.camera_fixed_i = static_cast<std::uint32_t>(parsed & static_cast<std::int64_t>(0xFFFFFFFFu));
-                } else {
-                    config.camera_mode    = CameraMode::cycle;
-                    config.camera_fixed_i = 0u;
-                }
                 break;
             }
         case CliKey::load_weights: config.load_weights_path = value; break;
@@ -251,8 +223,6 @@ int main(int argc, char** argv) {
             .occupancy_params         = occupancy_hp,
             .rays_per_batch           = config.rays_per_batch,
             .max_sample_steps_per_ray = config.max_sample_steps_per_ray,
-            .train_camera_mode        = config.camera_mode == CameraMode::fixed ? static_cast<std::uint32_t>(NERF_TRAIN_CAMERA_MODE_FIXED) : static_cast<std::uint32_t>(NERF_TRAIN_CAMERA_MODE_RANDOM),
-            .fixed_train_camera_idx   = config.camera_fixed_i,
         };
         status = nerf_configure_training(state.context, &training_config);
         if (status != NERF_STATUS_OK) throw std::runtime_error("nerf_configure_training failed: status=" + std::to_string(status));

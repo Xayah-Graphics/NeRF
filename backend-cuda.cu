@@ -2596,8 +2596,7 @@ namespace nerf::runtime {
         const bool same_plan = runtime.plan.configured && runtime.plan.training_request.max_sample_step_count == training_request.max_sample_step_count && runtime.plan.occupancy_request.max_update_tiles == occupancy_request.max_update_tiles && runtime.plan.config.aabb_min.x == config.aabb_min.x && runtime.plan.config.aabb_min.y == config.aabb_min.y && runtime.plan.config.aabb_min.z == config.aabb_min.z && runtime.plan.config.aabb_max.x == config.aabb_max.x
                             && runtime.plan.config.aabb_max.y == config.aabb_max.y && runtime.plan.config.aabb_max.z == config.aabb_max.z && runtime.plan.config.hyper_params.learning_rate == config.hyper_params.learning_rate && runtime.plan.config.hyper_params.adam_beta1 == config.hyper_params.adam_beta1 && runtime.plan.config.hyper_params.adam_beta2 == config.hyper_params.adam_beta2 && runtime.plan.config.hyper_params.adam_eps == config.hyper_params.adam_eps
                             && runtime.plan.config.hyper_params.lr_decay_ksteps == config.hyper_params.lr_decay_ksteps && runtime.plan.config.occupancy_params.decay == config.occupancy_params.decay && runtime.plan.config.occupancy_params.threshold == config.occupancy_params.threshold && runtime.plan.config.occupancy_params.cells_per_update == config.occupancy_params.cells_per_update
-                            && runtime.plan.config.occupancy_params.update_interval == config.occupancy_params.update_interval && runtime.plan.config.occupancy_params.warmup_steps == config.occupancy_params.warmup_steps && runtime.plan.config.rays_per_batch == config.rays_per_batch && runtime.plan.config.max_sample_steps_per_ray == config.max_sample_steps_per_ray && runtime.plan.config.train_camera_mode == config.train_camera_mode
-                            && runtime.plan.config.fixed_train_camera_idx == config.fixed_train_camera_idx;
+                            && runtime.plan.config.occupancy_params.update_interval == config.occupancy_params.update_interval && runtime.plan.config.occupancy_params.warmup_steps == config.occupancy_params.warmup_steps && runtime.plan.config.rays_per_batch == config.rays_per_batch && runtime.plan.config.max_sample_steps_per_ray == config.max_sample_steps_per_ray;
         if (same_plan) return true;
 
         if (cudaStreamSynchronize(runtime.stream) != cudaSuccess) return false;
@@ -2623,12 +2622,7 @@ namespace nerf::runtime {
         const std::uint32_t camera_count = runtime->plan.training_request.camera_count;
         std::uint32_t camera_idx         = 0u;
         if (camera_count != 0u) {
-            switch (runtime->plan.config.train_camera_mode) {
-            case NERF_TRAIN_CAMERA_MODE_FIXED: camera_idx = runtime->plan.config.fixed_train_camera_idx % camera_count; break;
-            case NERF_TRAIN_CAMERA_MODE_CYCLE: camera_idx = frame_index % camera_count; break;
-            case NERF_TRAIN_CAMERA_MODE_RANDOM: camera_idx = hash_u32(frame_index * 747796405u + 2891336453u) % camera_count; break;
-            default: return false;
-            }
+            camera_idx = hash_u32(frame_index * 747796405u + 2891336453u) % camera_count;
         }
 
         nerf::sampler::SamplerRequest sampler_request = runtime->plan.sampler_request;
@@ -2924,17 +2918,10 @@ NerfStatus nerf_configure_training(void* context, const NerfTrainingConfig* conf
     if (normalized.rays_per_batch == 0u) return NERF_STATUS_INVALID_ARGUMENT;
     if (normalized.max_sample_steps_per_ray == 0u) return NERF_STATUS_INVALID_ARGUMENT;
     if (normalized.max_sample_steps_per_ray > kMaxSampleStepsPerRay) return NERF_STATUS_RANGE_ERROR;
-    switch (normalized.train_camera_mode) {
-    case NERF_TRAIN_CAMERA_MODE_FIXED:
-    case NERF_TRAIN_CAMERA_MODE_CYCLE:
-    case NERF_TRAIN_CAMERA_MODE_RANDOM: break;
-    default: return NERF_STATUS_INVALID_ARGUMENT;
-    }
 
     ContextStorage* ctx = static_cast<ContextStorage*>(context);
     if (!ctx->dataset_loaded) return NERF_STATUS_DATASET_NOT_LOADED;
     if (normalized.rays_per_batch > ctx->max_batch_rays) return NERF_STATUS_RANGE_ERROR;
-    if (normalized.train_camera_mode == NERF_TRAIN_CAMERA_MODE_FIXED && normalized.fixed_train_camera_idx >= ctx->dataset_info.image_count) return NERF_STATUS_RANGE_ERROR;
     const std::uint64_t total_sample_steps = static_cast<std::uint64_t>(normalized.rays_per_batch) * static_cast<std::uint64_t>(normalized.max_sample_steps_per_ray);
     if (total_sample_steps > static_cast<std::uint64_t>(ctx->max_sample_steps)) return NERF_STATUS_RANGE_ERROR;
 

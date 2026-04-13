@@ -107,7 +107,6 @@ typedef struct NerfOccupancyParams {
     uint32_t update_interval;
     uint32_t warmup_steps;
 } NerfOccupancyParams;
-typedef enum NerfTrainCameraMode { NERF_TRAIN_CAMERA_MODE_FIXED = 0, NERF_TRAIN_CAMERA_MODE_CYCLE = 1, NERF_TRAIN_CAMERA_MODE_RANDOM = 2 } NerfTrainCameraMode;
 typedef struct NerfTrainingConfig {
     NerfVec3 aabb_min;
     NerfVec3 aabb_max;
@@ -115,8 +114,6 @@ typedef struct NerfTrainingConfig {
     NerfOccupancyParams occupancy_params;
     uint32_t rays_per_batch;
     uint32_t max_sample_steps_per_ray;
-    uint32_t train_camera_mode;
-    uint32_t fixed_train_camera_idx;
 } NerfTrainingConfig;
 NERF_API NerfStatus nerf_configure_training(void* context, const NerfTrainingConfig* config);
 
