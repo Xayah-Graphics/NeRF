@@ -2002,27 +2002,24 @@ namespace nerf::runtime {
         TrainStepConfig train_cfg{};
     };
 
-    struct TrainingPlan {
-        bool configured = false;
-        NerfTrainingConfig config{};
-        OccupancyUpdateRequest occupancy_request{};
-        nerf::sampler::SamplerRequest sampler_request{};
-        TrainingStepRequest training_request{};
-    };
-
     struct TrainRuntime {
         cudaStream_t stream = nullptr;
         nerf::network::NetworkSet network{};
         nerf::network::NetworkWorkspace workspace{};
         TrainingDeviceState* device_state = nullptr;
         std::uint32_t host_frame_index    = 0u;
-        TrainingPlan plan{};
+        bool training_configured          = false;
+        NerfTrainingConfig training_config{};
+        OccupancyUpdateRequest occupancy_request{};
+        nerf::sampler::SamplerRequest sampler_request{};
+        TrainingStepRequest training_request{};
         std::mutex run_mutex{};
     };
 
     struct DeviceContext {
         std::mutex train_runtime_mutex{};
         std::shared_ptr<TrainRuntime> train_runtime{};
+        bool dataset_loaded = false;
     };
 
 
@@ -2163,9 +2160,13 @@ namespace nerf::runtime {
         if (rt.network.color.adam_m.ptr) (void) cudaFree(rt.network.color.adam_m.ptr);
         if (rt.network.color.adam_v.ptr) (void) cudaFree(rt.network.color.adam_v.ptr);
 
-        rt.network          = nerf::network::NetworkSet{};
-        rt.plan             = TrainingPlan{};
-        rt.host_frame_index = 0u;
+        rt.network             = nerf::network::NetworkSet{};
+        rt.host_frame_index    = 0u;
+        rt.training_configured = false;
+        rt.training_config     = NerfTrainingConfig{};
+        rt.occupancy_request   = OccupancyUpdateRequest{};
+        rt.sampler_request     = nerf::sampler::SamplerRequest{};
+        rt.training_request    = TrainingStepRequest{};
     }
 
     static bool alloc_workspace(nerf::network::NetworkWorkspace& workspace, const std::uint32_t rows) {
@@ -2390,22 +2391,6 @@ namespace nerf::runtime {
         return true;
     }
 
-    static bool prepare_training_device_state(TrainRuntime& runtime, const std::uint32_t camera_idx) {
-        k_begin_training_step<<<1, 1, 0, runtime.stream>>>(runtime.device_state, camera_idx);
-        return cudaGetLastError() == cudaSuccess;
-    }
-
-    static bool read_training_device_stats(DeviceContext* device_context, NerfTrainStats* out_stats) {
-        if (!out_stats) return false;
-        const auto runtime = runtime_for_context(device_context);
-        if (!runtime) return false;
-        std::scoped_lock run_lock(runtime->run_mutex);
-        if (cudaStreamSynchronize(runtime->stream) != cudaSuccess) return false;
-        if (cudaMemcpy(out_stats, &runtime->device_state->stats, sizeof(NerfTrainStats), cudaMemcpyDeviceToHost) != cudaSuccess) return false;
-        runtime->host_frame_index = out_stats->completed_steps;
-        return true;
-    }
-
     static bool runtime_zero_network_gradients(TrainRuntime& runtime) {
         if (cudaMemsetAsync(runtime.network.density.gradients.ptr, 0, runtime.network.density.gradients.bytes, runtime.stream) != cudaSuccess) return false;
         if (cudaMemsetAsync(runtime.network.color.gradients.ptr, 0, runtime.network.color.gradients.bytes, runtime.stream) != cudaSuccess) return false;
@@ -2542,115 +2527,6 @@ namespace nerf::runtime {
         if (density_grid[idx] <= threshold) return;
         atomicOr(&bitfield[idx >> 5u], 1u << (idx & 31u));
     }
-
-    static bool runtime_run_occupancy_update(TrainRuntime& runtime, const OccupancyUpdateRequest& request) {
-        const std::uint32_t cell_count  = static_cast<std::uint32_t>(static_cast<std::uint64_t>(request.grid_res) * static_cast<std::uint64_t>(request.grid_res) * static_cast<std::uint64_t>(request.grid_res));
-        const std::uint32_t word_count  = static_cast<std::uint32_t>((request.bitfield_bytes + sizeof(std::uint32_t) - 1u) / sizeof(std::uint32_t));
-        const std::uint32_t total_rows  = request.max_update_tiles * kTrainChunkRows;
-        constexpr std::uint32_t block_x = kOccupancyBlockX;
-        const dim3 full_grid((cell_count + block_x - 1u) / block_x);
-        const dim3 word_grid((word_count + block_x - 1u) / block_x);
-        const dim3 tile_grid((total_rows + block_x - 1u) / block_x);
-
-        k_prepare_update_density_grid<<<full_grid, block_x, 0, runtime.stream>>>(request.density_grid, cell_count, request.decay, request.update_interval, request.warmup_steps, request.device_state);
-        if (const cudaError_t error = cudaGetLastError(); error != cudaSuccess) return false;
-        k_prepare_occupancy_bitfield<<<word_grid, block_x, 0, runtime.stream>>>(request.bitfield, word_count, request.update_interval, request.warmup_steps, request.device_state);
-        if (const cudaError_t error = cudaGetLastError(); error != cudaSuccess) return false;
-        if (total_rows == 0u) return true;
-
-        k_build_occ_inputs<<<tile_grid, block_x, 0, runtime.stream>>>(request.device_state, total_rows, request.cells_per_update, cell_count, request.grid_res, request.warmup_steps, request.update_interval, request.aabb_min, request.aabb_max, runtime.workspace.inputs_tmp);
-        if (const cudaError_t error = cudaGetLastError(); error != cudaSuccess) return false;
-        if (!nerf::encoder::run_encoder_module(runtime.stream, runtime.workspace.inputs_tmp, total_rows, runtime.workspace.enc_pts, runtime.workspace.enc_dir)) return false;
-        if (!nerf::network::run_network_inference(runtime.network, runtime.workspace, runtime.stream, nerf::network::NetworkInferenceRequest{.encoded_pts = runtime.workspace.enc_pts, .encoded_dir = runtime.workspace.enc_dir, .rows = total_rows, .raw_rgb = runtime.workspace.raw_rgb, .raw_sigma = runtime.workspace.raw_sigma})) return false;
-        k_update_density_from_sigma<<<tile_grid, block_x, 0, runtime.stream>>>(request.density_grid, runtime.workspace.raw_sigma, request.device_state, total_rows, request.cells_per_update, cell_count, request.warmup_steps, request.update_interval);
-        if (const cudaError_t error = cudaGetLastError(); error != cudaSuccess) return false;
-        k_rebuild_occ_from_density<<<full_grid, block_x, 0, runtime.stream>>>(request.density_grid, cell_count, request.threshold, request.warmup_steps, request.update_interval, request.device_state, request.bitfield);
-        return cudaGetLastError() == cudaSuccess;
-    }
-
-    static bool runtime_run_training_step(TrainRuntime& runtime, const TrainingStepRequest& request, const nerf::sampler::SampleBatchState& host_batch_state) {
-        if (!runtime_zero_network_gradients(runtime)) return false;
-        if (!runtime_zero_scalar_buffers(runtime)) return false;
-
-        nerf::network::NetworkTrainingRequest training_request{};
-        training_request.sample_rays  = request.sample_rays;
-        training_request.sample_steps = request.sample_steps;
-        training_request.batch_state  = request.batch_state;
-        training_request.ray_count    = host_batch_state.active_ray_count;
-        training_request.sample_count = host_batch_state.sample_step_count;
-        if (training_request.ray_count != 0u && training_request.sample_count != 0u) {
-            if (!nerf::network::run_network_training(runtime.network, runtime.workspace, runtime.stream, training_request)) return false;
-        }
-
-        runtime_accumulate_grad_stats(runtime);
-        if (cudaGetLastError() != cudaSuccess) return false;
-        k_finalize_training_stats<<<1, 1, 0, runtime.stream>>>(runtime.device_state, request.batch_state, runtime.workspace.loss_sum, runtime.workspace.grad_sumsq, runtime.workspace.nonfinite_flag);
-        if (cudaGetLastError() != cudaSuccess) return false;
-        if (!runtime_apply_optimizer(runtime, request.train_cfg)) return false;
-        k_commit_training_step<<<1, 1, 0, runtime.stream>>>(runtime.device_state);
-        return cudaGetLastError() == cudaSuccess;
-    }
-    static bool configure_training_plan(TrainRuntime& runtime, const OccupancyUpdateRequest& occupancy_request, const nerf::sampler::SamplerRequest& sampler_request, const TrainingStepRequest& training_request, const NerfTrainingConfig& config) {
-        std::scoped_lock run_lock(runtime.run_mutex);
-
-        const bool same_plan = runtime.plan.configured && runtime.plan.training_request.max_sample_step_count == training_request.max_sample_step_count && runtime.plan.occupancy_request.max_update_tiles == occupancy_request.max_update_tiles && runtime.plan.config.aabb_min.x == config.aabb_min.x && runtime.plan.config.aabb_min.y == config.aabb_min.y && runtime.plan.config.aabb_min.z == config.aabb_min.z && runtime.plan.config.aabb_max.x == config.aabb_max.x
-                            && runtime.plan.config.aabb_max.y == config.aabb_max.y && runtime.plan.config.aabb_max.z == config.aabb_max.z && runtime.plan.config.hyper_params.learning_rate == config.hyper_params.learning_rate && runtime.plan.config.hyper_params.adam_beta1 == config.hyper_params.adam_beta1 && runtime.plan.config.hyper_params.adam_beta2 == config.hyper_params.adam_beta2 && runtime.plan.config.hyper_params.adam_eps == config.hyper_params.adam_eps
-                            && runtime.plan.config.hyper_params.lr_decay_ksteps == config.hyper_params.lr_decay_ksteps && runtime.plan.config.occupancy_params.decay == config.occupancy_params.decay && runtime.plan.config.occupancy_params.threshold == config.occupancy_params.threshold && runtime.plan.config.occupancy_params.cells_per_update == config.occupancy_params.cells_per_update
-                            && runtime.plan.config.occupancy_params.update_interval == config.occupancy_params.update_interval && runtime.plan.config.occupancy_params.warmup_steps == config.occupancy_params.warmup_steps && runtime.plan.config.rays_per_batch == config.rays_per_batch && runtime.plan.config.max_sample_steps_per_ray == config.max_sample_steps_per_ray;
-        if (same_plan) return true;
-
-        if (cudaStreamSynchronize(runtime.stream) != cudaSuccess) return false;
-        const std::uint32_t occupancy_rows = occupancy_request.max_update_tiles * kTrainChunkRows;
-        const std::uint32_t workspace_rows = std::max(training_request.max_sample_step_count + kNetworkBatchGranularity, occupancy_rows);
-        if (!alloc_workspace(runtime.workspace, workspace_rows)) return false;
-        runtime.plan                   = TrainingPlan{};
-        runtime.plan.config            = config;
-        runtime.plan.occupancy_request = occupancy_request;
-        runtime.plan.sampler_request   = sampler_request;
-        runtime.plan.training_request  = training_request;
-        runtime.plan.configured        = true;
-        return true;
-    }
-
-    static bool run_training_plan(DeviceContext* device_context) {
-        const auto runtime = runtime_for_context(device_context);
-        if (!runtime) return false;
-        std::scoped_lock run_lock(runtime->run_mutex);
-        if (!runtime->plan.configured) return false;
-
-        const std::uint32_t frame_index  = runtime->host_frame_index;
-        const std::uint32_t camera_count = runtime->plan.training_request.camera_count;
-        std::uint32_t camera_idx         = 0u;
-        if (camera_count != 0u) {
-            camera_idx = hash_u32(frame_index * 747796405u + 2891336453u) % camera_count;
-        }
-
-        nerf::sampler::SamplerRequest sampler_request = runtime->plan.sampler_request;
-        sampler_request.frame_index                   = frame_index;
-        sampler_request.camera_idx                    = camera_idx;
-
-        if (!runtime_run_occupancy_update(*runtime, runtime->plan.occupancy_request)) return false;
-        if (!prepare_training_device_state(*runtime, camera_idx)) return false;
-        if (!nerf::sampler::run_sampler(sampler_request)) return false;
-        nerf::sampler::SampleBatchState host_batch_state{};
-        if (cudaMemcpyAsync(&host_batch_state, sampler_request.batch_state, sizeof(nerf::sampler::SampleBatchState), cudaMemcpyDeviceToHost, runtime->stream) != cudaSuccess) return false;
-        if (cudaStreamSynchronize(runtime->stream) != cudaSuccess) return false;
-        if (host_batch_state.overflow != 0u) {
-            if (!runtime_zero_network_gradients(*runtime)) return false;
-            if (!runtime_zero_scalar_buffers(*runtime)) return false;
-            k_finalize_training_stats<<<1, 1, 0, runtime->stream>>>(runtime->device_state, runtime->plan.training_request.batch_state, runtime->workspace.loss_sum, runtime->workspace.grad_sumsq, runtime->workspace.nonfinite_flag);
-            if (cudaGetLastError() != cudaSuccess) return false;
-            if (!runtime_apply_optimizer(*runtime, runtime->plan.training_request.train_cfg)) return false;
-            k_commit_training_step<<<1, 1, 0, runtime->stream>>>(runtime->device_state);
-            if (cudaGetLastError() != cudaSuccess) return false;
-            ++runtime->host_frame_index;
-            return true;
-        }
-
-        if (!runtime_run_training_step(*runtime, runtime->plan.training_request, host_batch_state)) return false;
-        ++runtime->host_frame_index;
-        return true;
-    }
 } // namespace nerf::runtime
 
 namespace {
@@ -2680,9 +2556,6 @@ namespace {
         std::uint32_t max_sample_steps      = 0u;
         std::uint32_t max_batch_rays        = 0u;
         std::uint64_t arena_alignment_bytes = 0u;
-        bool dataset_loaded                 = false;
-        bool training_configured            = false;
-        NerfTrainingConfig training_config{};
     };
 } // namespace
 
@@ -2841,7 +2714,16 @@ NerfStatus nerf_load_dataset(void* context, const NerfDatasetLoadDesc* desc, Ner
     if (load_status != NERF_STATUS_OK) return load_status;
 
     ContextStorage* ctx = static_cast<ContextStorage*>(context);
-    if (!nerf::runtime::destroy_runtime_for_context(ctx->cuda_context)) return NERF_STATUS_INTERNAL_ERROR;
+    std::shared_ptr<nerf::runtime::TrainRuntime> detached_runtime;
+    {
+        std::scoped_lock lock(ctx->cuda_context->train_runtime_mutex);
+        ctx->cuda_context->dataset_loaded = false;
+        detached_runtime                  = std::move(ctx->cuda_context->train_runtime);
+    }
+    if (detached_runtime) {
+        std::scoped_lock run_lock(detached_runtime->run_mutex);
+        nerf::runtime::destroy_runtime(*detached_runtime);
+    }
 
     if (ctx->scene_device_base) {
         if (cudaFree(ctx->scene_device_base) != cudaSuccess) return NERF_STATUS_CUDA_FAILURE;
@@ -2899,10 +2781,11 @@ NerfStatus nerf_load_dataset(void* context, const NerfDatasetLoadDesc* desc, Ner
         return NERF_STATUS_CUDA_FAILURE;
     }
 
-    ctx->dataset_info        = host_data.info;
-    ctx->dataset_loaded      = true;
-    ctx->training_configured = false;
-    ctx->training_config     = NerfTrainingConfig{};
+    ctx->dataset_info = host_data.info;
+    {
+        std::scoped_lock lock(ctx->cuda_context->train_runtime_mutex);
+        ctx->cuda_context->dataset_loaded = true;
+    }
 
     if (out_info) *out_info = ctx->dataset_info;
     return NERF_STATUS_OK;
@@ -2920,12 +2803,17 @@ NerfStatus nerf_configure_training(void* context, const NerfTrainingConfig* conf
     if (normalized.max_sample_steps_per_ray > kMaxSampleStepsPerRay) return NERF_STATUS_RANGE_ERROR;
 
     ContextStorage* ctx = static_cast<ContextStorage*>(context);
-    if (!ctx->dataset_loaded) return NERF_STATUS_DATASET_NOT_LOADED;
+    std::shared_ptr<nerf::runtime::TrainRuntime> runtime;
+    {
+        std::scoped_lock lock(ctx->cuda_context->train_runtime_mutex);
+        if (!ctx->cuda_context->dataset_loaded) return NERF_STATUS_DATASET_NOT_LOADED;
+        runtime = ctx->cuda_context->train_runtime;
+    }
     if (normalized.rays_per_batch > ctx->max_batch_rays) return NERF_STATUS_RANGE_ERROR;
     const std::uint64_t total_sample_steps = static_cast<std::uint64_t>(normalized.rays_per_batch) * static_cast<std::uint64_t>(normalized.max_sample_steps_per_ray);
     if (total_sample_steps > static_cast<std::uint64_t>(ctx->max_sample_steps)) return NERF_STATUS_RANGE_ERROR;
 
-    const auto runtime = nerf::runtime::runtime_for_context(ctx->cuda_context);
+    if (!runtime) runtime = nerf::runtime::runtime_for_context(ctx->cuda_context);
     if (!runtime) return NERF_STATUS_INTERNAL_ERROR;
 
     const std::uint32_t occupancy_cell_count = static_cast<std::uint32_t>(static_cast<std::uint64_t>(ctx->occupancy_grid_res) * static_cast<std::uint64_t>(ctx->occupancy_grid_res) * static_cast<std::uint64_t>(ctx->occupancy_grid_res));
@@ -2976,10 +2864,26 @@ NerfStatus nerf_configure_training(void* context, const NerfTrainingConfig* conf
                 .lr_decay_ksteps = normalized.hyper_params.lr_decay_ksteps,
             },
     };
-    if (!nerf::runtime::configure_training_plan(*runtime, occupancy_request, sampler_request, training_request, normalized)) return NERF_STATUS_INTERNAL_ERROR;
+    {
+        std::scoped_lock run_lock(runtime->run_mutex);
+        const bool same_plan = runtime->training_configured && runtime->training_request.max_sample_step_count == training_request.max_sample_step_count && runtime->occupancy_request.max_update_tiles == occupancy_request.max_update_tiles && runtime->training_config.aabb_min.x == normalized.aabb_min.x && runtime->training_config.aabb_min.y == normalized.aabb_min.y && runtime->training_config.aabb_min.z == normalized.aabb_min.z
+                            && runtime->training_config.aabb_max.x == normalized.aabb_max.x && runtime->training_config.aabb_max.y == normalized.aabb_max.y && runtime->training_config.aabb_max.z == normalized.aabb_max.z && runtime->training_config.hyper_params.learning_rate == normalized.hyper_params.learning_rate && runtime->training_config.hyper_params.adam_beta1 == normalized.hyper_params.adam_beta1
+                            && runtime->training_config.hyper_params.adam_beta2 == normalized.hyper_params.adam_beta2 && runtime->training_config.hyper_params.adam_eps == normalized.hyper_params.adam_eps && runtime->training_config.hyper_params.lr_decay_ksteps == normalized.hyper_params.lr_decay_ksteps && runtime->training_config.occupancy_params.decay == normalized.occupancy_params.decay
+                            && runtime->training_config.occupancy_params.threshold == normalized.occupancy_params.threshold && runtime->training_config.occupancy_params.cells_per_update == normalized.occupancy_params.cells_per_update && runtime->training_config.occupancy_params.update_interval == normalized.occupancy_params.update_interval && runtime->training_config.occupancy_params.warmup_steps == normalized.occupancy_params.warmup_steps
+                            && runtime->training_config.rays_per_batch == normalized.rays_per_batch && runtime->training_config.max_sample_steps_per_ray == normalized.max_sample_steps_per_ray;
+        if (!same_plan) {
+            if (cudaStreamSynchronize(runtime->stream) != cudaSuccess) return NERF_STATUS_INTERNAL_ERROR;
+            const std::uint32_t occupancy_rows = occupancy_request.max_update_tiles * kTrainChunkRows;
+            const std::uint32_t workspace_rows = std::max(training_request.max_sample_step_count + kNetworkBatchGranularity, occupancy_rows);
+            if (!nerf::runtime::alloc_workspace(runtime->workspace, workspace_rows)) return NERF_STATUS_INTERNAL_ERROR;
+            runtime->training_config     = normalized;
+            runtime->occupancy_request   = occupancy_request;
+            runtime->sampler_request     = sampler_request;
+            runtime->training_request    = training_request;
+            runtime->training_configured = true;
+        }
+    }
 
-    ctx->training_configured = true;
-    ctx->training_config     = normalized;
     return NERF_STATUS_OK;
 }
 
@@ -2987,17 +2891,96 @@ NerfStatus nerf_train_step(void* context) {
     if (!context) return NERF_STATUS_INVALID_ARGUMENT;
 
     const ContextStorage* ctx = static_cast<ContextStorage*>(context);
-    if (!ctx->dataset_loaded) return NERF_STATUS_DATASET_NOT_LOADED;
-    if (!ctx->training_configured) return NERF_STATUS_TRAINING_NOT_CONFIGURED;
-    if (!nerf::runtime::run_training_plan(ctx->cuda_context)) return NERF_STATUS_INTERNAL_ERROR;
+    std::shared_ptr<nerf::runtime::TrainRuntime> runtime;
+    {
+        std::scoped_lock lock(ctx->cuda_context->train_runtime_mutex);
+        if (!ctx->cuda_context->dataset_loaded) return NERF_STATUS_DATASET_NOT_LOADED;
+        runtime = ctx->cuda_context->train_runtime;
+    }
+    if (!runtime || !runtime->training_configured) return NERF_STATUS_TRAINING_NOT_CONFIGURED;
+    std::scoped_lock run_lock(runtime->run_mutex);
+    if (!runtime->training_configured) return NERF_STATUS_TRAINING_NOT_CONFIGURED;
+
+    const std::uint32_t frame_index  = runtime->host_frame_index;
+    const std::uint32_t camera_count = runtime->training_request.camera_count;
+    std::uint32_t camera_idx         = 0u;
+    if (camera_count != 0u) camera_idx = nerf::runtime::hash_u32(frame_index * 747796405u + 2891336453u) % camera_count;
+
+    nerf::sampler::SamplerRequest sampler_request = runtime->sampler_request;
+    sampler_request.frame_index                   = frame_index;
+    sampler_request.camera_idx                    = camera_idx;
+
+    const nerf::runtime::OccupancyUpdateRequest& occupancy_request = runtime->occupancy_request;
+    const std::uint32_t cell_count                                 = static_cast<std::uint32_t>(static_cast<std::uint64_t>(occupancy_request.grid_res) * static_cast<std::uint64_t>(occupancy_request.grid_res) * static_cast<std::uint64_t>(occupancy_request.grid_res));
+    const std::uint32_t word_count                                 = static_cast<std::uint32_t>((occupancy_request.bitfield_bytes + sizeof(std::uint32_t) - 1u) / sizeof(std::uint32_t));
+    const std::uint32_t total_rows                                 = occupancy_request.max_update_tiles * kTrainChunkRows;
+    constexpr std::uint32_t block_x                                = kOccupancyBlockX;
+    const dim3 full_grid((cell_count + block_x - 1u) / block_x);
+    const dim3 word_grid((word_count + block_x - 1u) / block_x);
+    const dim3 tile_grid((total_rows + block_x - 1u) / block_x);
+
+    nerf::runtime::k_prepare_update_density_grid<<<full_grid, block_x, 0, runtime->stream>>>(occupancy_request.density_grid, cell_count, occupancy_request.decay, occupancy_request.update_interval, occupancy_request.warmup_steps, occupancy_request.device_state);
+    if (const cudaError_t error = cudaGetLastError(); error != cudaSuccess) return NERF_STATUS_INTERNAL_ERROR;
+    nerf::runtime::k_prepare_occupancy_bitfield<<<word_grid, block_x, 0, runtime->stream>>>(occupancy_request.bitfield, word_count, occupancy_request.update_interval, occupancy_request.warmup_steps, occupancy_request.device_state);
+    if (const cudaError_t error = cudaGetLastError(); error != cudaSuccess) return NERF_STATUS_INTERNAL_ERROR;
+    if (total_rows != 0u) {
+        nerf::runtime::k_build_occ_inputs<<<tile_grid, block_x, 0, runtime->stream>>>(occupancy_request.device_state, total_rows, occupancy_request.cells_per_update, cell_count, occupancy_request.grid_res, occupancy_request.warmup_steps, occupancy_request.update_interval, occupancy_request.aabb_min, occupancy_request.aabb_max, runtime->workspace.inputs_tmp);
+        if (const cudaError_t error = cudaGetLastError(); error != cudaSuccess) return NERF_STATUS_INTERNAL_ERROR;
+        if (!nerf::encoder::run_encoder_module(runtime->stream, runtime->workspace.inputs_tmp, total_rows, runtime->workspace.enc_pts, runtime->workspace.enc_dir)) return NERF_STATUS_INTERNAL_ERROR;
+        if (!nerf::network::run_network_inference(runtime->network, runtime->workspace, runtime->stream, nerf::network::NetworkInferenceRequest{.encoded_pts = runtime->workspace.enc_pts, .encoded_dir = runtime->workspace.enc_dir, .rows = total_rows, .raw_rgb = runtime->workspace.raw_rgb, .raw_sigma = runtime->workspace.raw_sigma})) return NERF_STATUS_INTERNAL_ERROR;
+        nerf::runtime::k_update_density_from_sigma<<<tile_grid, block_x, 0, runtime->stream>>>(occupancy_request.density_grid, runtime->workspace.raw_sigma, occupancy_request.device_state, total_rows, occupancy_request.cells_per_update, cell_count, occupancy_request.warmup_steps, occupancy_request.update_interval);
+        if (const cudaError_t error = cudaGetLastError(); error != cudaSuccess) return NERF_STATUS_INTERNAL_ERROR;
+        nerf::runtime::k_rebuild_occ_from_density<<<full_grid, block_x, 0, runtime->stream>>>(occupancy_request.density_grid, cell_count, occupancy_request.threshold, occupancy_request.warmup_steps, occupancy_request.update_interval, occupancy_request.device_state, occupancy_request.bitfield);
+        if (cudaGetLastError() != cudaSuccess) return NERF_STATUS_INTERNAL_ERROR;
+    }
+
+    nerf::runtime::k_begin_training_step<<<1, 1, 0, runtime->stream>>>(runtime->device_state, camera_idx);
+    if (cudaGetLastError() != cudaSuccess) return NERF_STATUS_INTERNAL_ERROR;
+    if (!nerf::sampler::run_sampler(sampler_request)) return NERF_STATUS_INTERNAL_ERROR;
+    nerf::sampler::SampleBatchState host_batch_state{};
+    if (cudaMemcpyAsync(&host_batch_state, sampler_request.batch_state, sizeof(nerf::sampler::SampleBatchState), cudaMemcpyDeviceToHost, runtime->stream) != cudaSuccess) return NERF_STATUS_INTERNAL_ERROR;
+    if (cudaStreamSynchronize(runtime->stream) != cudaSuccess) return NERF_STATUS_INTERNAL_ERROR;
+
+    if (!nerf::runtime::runtime_zero_network_gradients(*runtime)) return NERF_STATUS_INTERNAL_ERROR;
+    if (!nerf::runtime::runtime_zero_scalar_buffers(*runtime)) return NERF_STATUS_INTERNAL_ERROR;
+    if (host_batch_state.overflow == 0u) {
+        nerf::network::NetworkTrainingRequest training_request{};
+        training_request.sample_rays  = runtime->training_request.sample_rays;
+        training_request.sample_steps = runtime->training_request.sample_steps;
+        training_request.batch_state  = runtime->training_request.batch_state;
+        training_request.ray_count    = host_batch_state.active_ray_count;
+        training_request.sample_count = host_batch_state.sample_step_count;
+        if (training_request.ray_count != 0u && training_request.sample_count != 0u) {
+            if (!nerf::network::run_network_training(runtime->network, runtime->workspace, runtime->stream, training_request)) return NERF_STATUS_INTERNAL_ERROR;
+        }
+        nerf::runtime::runtime_accumulate_grad_stats(*runtime);
+        if (cudaGetLastError() != cudaSuccess) return NERF_STATUS_INTERNAL_ERROR;
+    }
+
+    nerf::runtime::k_finalize_training_stats<<<1, 1, 0, runtime->stream>>>(runtime->device_state, runtime->training_request.batch_state, runtime->workspace.loss_sum, runtime->workspace.grad_sumsq, runtime->workspace.nonfinite_flag);
+    if (cudaGetLastError() != cudaSuccess) return NERF_STATUS_INTERNAL_ERROR;
+    if (!nerf::runtime::runtime_apply_optimizer(*runtime, runtime->training_request.train_cfg)) return NERF_STATUS_INTERNAL_ERROR;
+    nerf::runtime::k_commit_training_step<<<1, 1, 0, runtime->stream>>>(runtime->device_state);
+    if (cudaGetLastError() != cudaSuccess) return NERF_STATUS_INTERNAL_ERROR;
+
+    ++runtime->host_frame_index;
     return NERF_STATUS_OK;
 }
 
 NerfStatus nerf_read_train_stats(void* context, NerfTrainStats* out_stats) {
     if (!context || !out_stats) return NERF_STATUS_INVALID_ARGUMENT;
     const ContextStorage* ctx = static_cast<ContextStorage*>(context);
-    if (!ctx->training_configured) return NERF_STATUS_TRAINING_NOT_CONFIGURED;
-    if (!nerf::runtime::read_training_device_stats(ctx->cuda_context, out_stats)) return NERF_STATUS_INTERNAL_ERROR;
+
+    std::shared_ptr<nerf::runtime::TrainRuntime> runtime;
+    {
+        std::scoped_lock lock(ctx->cuda_context->train_runtime_mutex);
+        runtime = ctx->cuda_context->train_runtime;
+    }
+    if (!runtime || !runtime->training_configured) return NERF_STATUS_TRAINING_NOT_CONFIGURED;
+    std::scoped_lock run_lock(runtime->run_mutex);
+    if (cudaStreamSynchronize(runtime->stream) != cudaSuccess) return NERF_STATUS_INTERNAL_ERROR;
+    if (cudaMemcpy(out_stats, &runtime->device_state->stats, sizeof(NerfTrainStats), cudaMemcpyDeviceToHost) != cudaSuccess) return NERF_STATUS_INTERNAL_ERROR;
+    runtime->host_frame_index = out_stats->completed_steps;
     return NERF_STATUS_OK;
 }
 
