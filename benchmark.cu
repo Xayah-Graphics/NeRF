@@ -1,5 +1,4 @@
 #include "nerf.h"
-#include <array>
 #include <charconv>
 #include <chrono>
 #include <filesystem>
@@ -14,142 +13,88 @@ constexpr std::uint32_t kDefaultRays           = 4096u;
 constexpr std::uint32_t kDefaultMaxSampleSteps = 64u;
 constexpr std::uint32_t kDefaultLogInterval    = 200u;
 
-enum class CliKey : std::uint8_t {
-    dataset,
-    steps,
-    rays,
-    max_sample_steps,
-    log_interval,
-    load_weights,
-    save_weights,
-    help,
-    unknown,
-};
+static bool parse_u32(std::string_view value, std::uint32_t& out) {
+    std::uint64_t parsed = 0u;
+    const auto [ptr, ec] = std::from_chars(value.data(), value.data() + value.size(), parsed);
+    if (ec != std::errc{} || ptr != value.data() + value.size() || parsed > std::numeric_limits<std::uint32_t>::max()) return false;
+    out = static_cast<std::uint32_t>(parsed);
+    return true;
+}
 
 int main(int argc, char** argv) {
-    struct BenchmarkConfig {
-        std::filesystem::path dataset_path{};
-        std::uint32_t steps                    = kDefaultSteps;
-        std::uint32_t rays_per_batch           = kDefaultRays;
-        std::uint32_t max_sample_steps_per_ray = kDefaultMaxSampleSteps;
-        std::uint32_t log_interval             = kDefaultLogInterval;
-        std::filesystem::path load_weights_path{};
-        std::filesystem::path save_weights_path{};
-    } config{};
+    std::filesystem::path dataset_path{};
+    std::filesystem::path load_weights_path{};
+    std::filesystem::path save_weights_path{};
+    std::uint32_t steps            = kDefaultSteps;
+    std::uint32_t rays_per_batch   = kDefaultRays;
+    std::uint32_t max_sample_steps = kDefaultMaxSampleSteps;
+    std::uint32_t log_interval     = kDefaultLogInterval;
 
-    struct CliOptionDesc {
-        std::string_view name{};
-        CliKey key       = CliKey::unknown;
-        bool needs_value = false;
+    auto print_help = [&]() {
+        const std::string exe_name = (argc > 0 && argv[0]) ? std::filesystem::path(argv[0]).filename().string() : std::string{"benchmark"};
+        std::cout << "Usage: " << exe_name << " --dataset <path> [options]\n";
+        std::cout << "  --steps <N> default " << steps << '\n';
+        std::cout << "  --rays <N> default " << rays_per_batch << '\n';
+        std::cout << "  --max-sample-steps <N> default " << max_sample_steps << '\n';
+        std::cout << "  --log-interval <N> default " << log_interval << '\n';
+        std::cout << "  --load-weights <path> optional\n";
+        std::cout << "  --save-weights <path> optional\n";
     };
 
-    constexpr std::array<CliOptionDesc, 7> cli_desc{{
-        {.name = "--dataset", .key = CliKey::dataset, .needs_value = true},
-        {.name = "--steps", .key = CliKey::steps, .needs_value = true},
-        {.name = "--rays", .key = CliKey::rays, .needs_value = true},
-        {.name = "--max-sample-steps", .key = CliKey::max_sample_steps, .needs_value = true},
-        {.name = "--log-interval", .key = CliKey::log_interval, .needs_value = true},
-        {.name = "--load-weights", .key = CliKey::load_weights, .needs_value = true},
-        {.name = "--save-weights", .key = CliKey::save_weights, .needs_value = true},
-    }};
-
     for (int i = 1; i < argc; ++i) {
-        const std::string_view raw_key = argv[i];
-        CliOptionDesc option{};
-        option.key = CliKey::unknown;
-        for (const CliOptionDesc& desc : cli_desc) {
-            if (desc.name == raw_key) {
-                option = desc;
-                break;
-            }
-        }
-        if (raw_key == "--help" || raw_key == "-h") option = CliOptionDesc{.name = "--help", .key = CliKey::help, .needs_value = false};
-
-        if (option.key == CliKey::help) {
-            std::string exe_name = (argc > 0 && argv[0]) ? std::filesystem::path(argv[0]).filename().string() : std::string{"benchmark"};
-            std::cout << "Usage: " << exe_name << " --dataset <path> [options]\n";
-            std::cout << "  --steps <N> default " << config.steps << '\n';
-            std::cout << "  --rays <N> default " << config.rays_per_batch << '\n';
-            std::cout << "  --max-sample-steps <N> default " << config.max_sample_steps_per_ray << '\n';
-            std::cout << "  --log-interval <N> default " << config.log_interval << '\n';
-            std::cout << "  --load-weights <path> optional\n";
-            std::cout << "  --save-weights <path> optional\n";
+        const std::string_view key = argv[i];
+        if (key == "--help" || key == "-h") {
+            print_help();
             return 0;
         }
-
-        if (option.key == CliKey::unknown) {
-            std::cerr << "unknown argument: " << raw_key << '\n';
-            return 2;
-        }
-        if (option.needs_value && i + 1 >= argc) {
-            std::cerr << "missing value for " << option.name << '\n';
+        if (i + 1 >= argc) {
+            std::cerr << "missing value for " << key << '\n';
             return 2;
         }
 
-        const std::string_view value = option.needs_value ? std::string_view{argv[++i]} : std::string_view{};
-        switch (option.key) {
-        case CliKey::dataset: config.dataset_path = value; break;
-        case CliKey::steps:
-            {
-                std::uint64_t parsed = 0u;
-                const auto [ptr, ec] = std::from_chars(value.data(), value.data() + value.size(), parsed);
-                if (ec != std::errc{} || ptr != value.data() + value.size() || parsed > std::numeric_limits<std::uint32_t>::max()) {
-                    std::cerr << "invalid value for --steps: " << value << '\n';
-                    return 2;
-                }
-                config.steps = static_cast<std::uint32_t>(parsed);
-                break;
+        const std::string_view value = argv[++i];
+        if (key == "--dataset") {
+            dataset_path = value;
+        } else if (key == "--load-weights") {
+            load_weights_path = value;
+        } else if (key == "--save-weights") {
+            save_weights_path = value;
+        } else if (key == "--steps") {
+            if (!parse_u32(value, steps)) {
+                std::cerr << "invalid value for --steps: " << value << '\n';
+                return 2;
             }
-        case CliKey::rays:
-            {
-                std::uint64_t parsed = 0u;
-                const auto [ptr, ec] = std::from_chars(value.data(), value.data() + value.size(), parsed);
-                if (ec != std::errc{} || ptr != value.data() + value.size() || parsed > std::numeric_limits<std::uint32_t>::max()) {
-                    std::cerr << "invalid value for --rays: " << value << '\n';
-                    return 2;
-                }
-                config.rays_per_batch = static_cast<std::uint32_t>(parsed);
-                break;
+        } else if (key == "--rays") {
+            if (!parse_u32(value, rays_per_batch)) {
+                std::cerr << "invalid value for --rays: " << value << '\n';
+                return 2;
             }
-        case CliKey::max_sample_steps:
-            {
-                std::uint64_t parsed = 0u;
-                const auto [ptr, ec] = std::from_chars(value.data(), value.data() + value.size(), parsed);
-                if (ec != std::errc{} || ptr != value.data() + value.size() || parsed > std::numeric_limits<std::uint32_t>::max()) {
-                    std::cerr << "invalid value for --max-sample-steps: " << value << '\n';
-                    return 2;
-                }
-                config.max_sample_steps_per_ray = static_cast<std::uint32_t>(parsed);
-                break;
+        } else if (key == "--max-sample-steps") {
+            if (!parse_u32(value, max_sample_steps)) {
+                std::cerr << "invalid value for --max-sample-steps: " << value << '\n';
+                return 2;
             }
-        case CliKey::log_interval:
-            {
-                std::uint64_t parsed = 0u;
-                const auto [ptr, ec] = std::from_chars(value.data(), value.data() + value.size(), parsed);
-                if (ec != std::errc{} || ptr != value.data() + value.size() || parsed > std::numeric_limits<std::uint32_t>::max()) {
-                    std::cerr << "invalid value for --log-interval: " << value << '\n';
-                    return 2;
-                }
-                config.log_interval = static_cast<std::uint32_t>(parsed);
-                break;
+        } else if (key == "--log-interval") {
+            if (!parse_u32(value, log_interval)) {
+                std::cerr << "invalid value for --log-interval: " << value << '\n';
+                return 2;
             }
-        case CliKey::load_weights: config.load_weights_path = value; break;
-        case CliKey::save_weights: config.save_weights_path = value; break;
-        default: break;
+        } else {
+            std::cerr << "unknown argument: " << key << '\n';
+            return 2;
         }
     }
 
-    if (config.dataset_path.empty()) {
+    if (dataset_path.empty()) {
         std::cerr << "--dataset is required\n";
         return 2;
     }
-    if (config.steps == 0u || config.rays_per_batch == 0u || config.max_sample_steps_per_ray == 0u || config.log_interval == 0u) {
+    if (steps == 0u || rays_per_batch == 0u || max_sample_steps == 0u || log_interval == 0u) {
         std::cerr << "steps/rays/max-sample-steps/log-interval must be > 0\n";
         return 2;
     }
 
     void* context = nullptr;
-
     struct ContextGuard {
         void** context = nullptr;
         ~ContextGuard() {
@@ -192,7 +137,7 @@ int main(int argc, char** argv) {
         NerfStatus status = nerf_create_context(&create_desc, &context);
         if (status != NERF_STATUS_OK) throw std::runtime_error("nerf_create_context failed: status=" + std::to_string(status));
 
-        const std::string dataset_path_utf8 = config.dataset_path.string();
+        const std::string dataset_path_utf8 = dataset_path.string();
         const NerfDatasetLoadDesc load_desc{
             .path_utf8     = dataset_path_utf8.c_str(),
             .offset        = NerfVec3{0.5f, 0.5f, 0.5f},
@@ -203,8 +148,8 @@ int main(int argc, char** argv) {
         status = nerf_load_dataset(context, &load_desc, nullptr);
         if (status != NERF_STATUS_OK) throw std::runtime_error("nerf_load_dataset failed: status=" + std::to_string(status));
 
-        if (!config.load_weights_path.empty()) {
-            const std::string load_path_utf8 = config.load_weights_path.string();
+        if (!load_weights_path.empty()) {
+            const std::string load_path_utf8 = load_weights_path.string();
             const NerfCheckpointFileDesc checkpoint_desc{.path_utf8 = load_path_utf8.c_str()};
             status = nerf_load_network_weights(context, &checkpoint_desc);
             if (status != NERF_STATUS_OK) throw std::runtime_error("nerf_load_network_weights failed: status=" + std::to_string(status));
@@ -215,47 +160,36 @@ int main(int argc, char** argv) {
             .aabb_max                 = NerfVec3{1.0f, 1.0f, 1.0f},
             .hyper_params             = train_hp,
             .occupancy_params         = occupancy_hp,
-            .rays_per_batch           = config.rays_per_batch,
-            .max_sample_steps_per_ray = config.max_sample_steps_per_ray,
+            .rays_per_batch           = rays_per_batch,
+            .max_sample_steps_per_ray = max_sample_steps,
         };
         status = nerf_configure_training(context, &training_config);
         if (status != NERF_STATUS_OK) throw std::runtime_error("nerf_configure_training failed: status=" + std::to_string(status));
 
         const auto t0  = std::chrono::steady_clock::now();
         float loss_ema = 0.0f;
-
-        struct StepState {
-            float loss          = 0.0f;
-            float grad_norm     = 0.0f;
-            bool has_nonfinite  = false;
-            float sec           = 0.0f;
-            float steps_per_sec = 0.0f;
-            double eta_sec      = std::numeric_limits<double>::infinity();
-        };
-
-        for (std::uint32_t step = 0u; step < config.steps; ++step) {
+        for (std::uint32_t step = 0u; step < steps; ++step) {
             status = nerf_train_step(context);
             if (status != NERF_STATUS_OK) throw std::runtime_error("nerf_train_step failed: status=" + std::to_string(status));
 
-            StepState step_state{};
-            NerfTrainStats train_stats{};
-            if ((step + 1u) % config.log_interval == 0u || (step + 1u) == config.steps) {
+            if ((step + 1u) % log_interval == 0u || (step + 1u) == steps) {
+                NerfTrainStats train_stats{};
                 status = nerf_read_train_stats(context, &train_stats);
                 if (status != NERF_STATUS_OK) throw std::runtime_error("nerf_read_train_stats failed: status=" + std::to_string(status));
-                step_state.loss          = train_stats.loss;
-                step_state.grad_norm     = train_stats.grad_norm;
-                step_state.has_nonfinite = train_stats.has_nonfinite != 0u;
-                loss_ema                 = step == 0u ? step_state.loss : (0.95f * loss_ema + 0.05f * step_state.loss);
-                const auto now           = std::chrono::steady_clock::now();
-                step_state.sec           = std::chrono::duration<float>(now - t0).count();
-                step_state.steps_per_sec = step_state.sec > 0.0f ? static_cast<float>(step + 1u) / step_state.sec : 0.0f;
-                if (step_state.steps_per_sec > 0.0f) step_state.eta_sec = static_cast<double>(config.steps - (step + 1u)) / static_cast<double>(step_state.steps_per_sec);
-                std::cout << "[train] step=" << (step + 1u) << " loss=" << step_state.loss << " loss_ema=" << loss_ema << " grad_norm=" << step_state.grad_norm << " sps=" << step_state.steps_per_sec << " eta_sec=" << step_state.eta_sec << " nonfinite=" << (step_state.has_nonfinite ? 1 : 0) << '\n';
+
+                const float loss          = train_stats.loss;
+                const float grad_norm     = train_stats.grad_norm;
+                const bool has_nonfinite  = train_stats.has_nonfinite != 0u;
+                loss_ema                  = step == 0u ? loss : (0.95f * loss_ema + 0.05f * loss);
+                const float sec           = std::chrono::duration<float>(std::chrono::steady_clock::now() - t0).count();
+                const float steps_per_sec = sec > 0.0f ? static_cast<float>(step + 1u) / sec : 0.0f;
+                const double eta_sec      = steps_per_sec > 0.0f ? static_cast<double>(steps - (step + 1u)) / static_cast<double>(steps_per_sec) : std::numeric_limits<double>::infinity();
+                std::cout << "[train] step=" << (step + 1u) << " loss=" << loss << " loss_ema=" << loss_ema << " grad_norm=" << grad_norm << " sps=" << steps_per_sec << " eta_sec=" << eta_sec << " nonfinite=" << (has_nonfinite ? 1 : 0) << '\n';
             }
         }
 
-        if (!config.save_weights_path.empty()) {
-            const std::string save_path_utf8 = config.save_weights_path.string();
+        if (!save_weights_path.empty()) {
+            const std::string save_path_utf8 = save_weights_path.string();
             const NerfCheckpointFileDesc checkpoint_desc{.path_utf8 = save_path_utf8.c_str()};
             status = nerf_save_network_weights(context, &checkpoint_desc);
             if (status != NERF_STATUS_OK) throw std::runtime_error("nerf_save_network_weights failed: status=" + std::to_string(status));
