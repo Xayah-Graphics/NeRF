@@ -88,6 +88,7 @@ target_include_directories(nerf PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/vendor")
 # Benchmark
 # ============================================================================
 if (NERF_BUILD_BENCHMARK)
-    add_executable(benchmark benchmark.cu)
+    add_executable(benchmark benchmark.cpp)
     target_link_libraries(benchmark PRIVATE nerf)
+    set_property(TARGET benchmark PROPERTY CXX_MODULE_STD ON)
 endif ()

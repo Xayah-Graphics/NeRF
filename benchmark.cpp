@@ -1,12 +1,5 @@
 #include "nerf.h"
-#include <charconv>
-#include <chrono>
-#include <filesystem>
-#include <iostream>
-#include <limits>
-#include <stdexcept>
-#include <string>
-#include <string_view>
+import std;
 
 constexpr std::uint32_t kDefaultSteps          = 10000u;
 constexpr std::uint32_t kDefaultRays           = 4096u;
