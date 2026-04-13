@@ -128,7 +128,6 @@ namespace nerf::sampler {
     struct SampleBatchState {
         std::uint32_t active_ray_count  = 0u;
         std::uint32_t sample_step_count = 0u;
-        std::uint32_t overflow          = 0u;
     };
 
     struct SamplerRequest {
@@ -652,7 +651,6 @@ namespace nerf::sampler {
             if (blockIdx.x != 0u || threadIdx.x != 0u) return;
             batch_state->active_ray_count  = 0u;
             batch_state->sample_step_count = 0u;
-            batch_state->overflow          = 0u;
         }
 
         __global__ void k_sample_rays_flat(const std::uint32_t frame_index, const std::uint32_t camera_idx, const float4* __restrict__ cams, const std::uint8_t* __restrict__ images, const std::uint32_t image_width, const std::uint32_t image_height, const std::uint32_t rays_per_batch, const std::uint32_t max_sample_steps_per_ray, const std::uint32_t max_sample_step_count, const float3 aabb_min, const float3 aabb_max, const std::uint32_t* __restrict__ bitfield,
@@ -746,10 +744,6 @@ namespace nerf::sampler {
 
             const std::uint32_t active_slot  = atomicAdd(&batch_state->active_ray_count, 1u);
             const std::uint32_t sample_begin = atomicAdd(&batch_state->sample_step_count, sample_count);
-            if (active_slot >= rays_per_batch || sample_begin > max_sample_step_count || sample_count > max_sample_step_count - sample_begin) {
-                atomicExch(&batch_state->overflow, 1u);
-                return;
-            }
 
             for (std::uint32_t i = 0u; i < sample_count; ++i) {
                 const float t_mid = sample_t_mid[i];
@@ -1796,7 +1790,7 @@ namespace nerf::runtime {
         const float inv_norm              = active_rays == 0u ? 0.0f : 1.0f / static_cast<float>(active_rays);
         const float loss                  = *loss_sum * inv_norm;
         const float grad_norm             = sqrtf(fmaxf(0.0f, *grad_sumsq)) / kNetworkLossScale;
-        const std::uint32_t has_nonfinite = *nonfinite_flag != 0u || batch_state->overflow != 0u || !isfinite(loss) || !isfinite(grad_norm) ? 1u : 0u;
+        const std::uint32_t has_nonfinite = *nonfinite_flag != 0u || !isfinite(loss) || !isfinite(grad_norm) ? 1u : 0u;
         state->optimizer_step             = state->frame_index + 1u;
         state->stats.loss                 = loss;
         state->stats.grad_norm            = grad_norm;
@@ -2653,27 +2647,25 @@ NerfStatus nerf_train_step(void* context) {
     if (cudaMemsetAsync(runtime->workspace.loss_sum, 0, sizeof(float), runtime->stream) != cudaSuccess) return NERF_STATUS_INTERNAL_ERROR;
     if (cudaMemsetAsync(runtime->workspace.grad_sumsq, 0, sizeof(float), runtime->stream) != cudaSuccess) return NERF_STATUS_INTERNAL_ERROR;
     if (cudaMemsetAsync(runtime->workspace.nonfinite_flag, 0, sizeof(std::uint32_t), runtime->stream) != cudaSuccess) return NERF_STATUS_INTERNAL_ERROR;
-    if (host_batch_state.overflow == 0u) {
-        nerf::network::NetworkTrainingRequest training_request{};
-        training_request.sample_rays  = runtime->training_request.sample_rays;
-        training_request.sample_steps = runtime->training_request.sample_steps;
-        training_request.batch_state  = runtime->training_request.batch_state;
-        training_request.ray_count    = host_batch_state.active_ray_count;
-        training_request.sample_count = host_batch_state.sample_step_count;
-        if (training_request.ray_count != 0u && training_request.sample_count != 0u) {
-            if (!nerf::network::run_network_training(runtime->network, runtime->workspace, runtime->stream, training_request)) return NERF_STATUS_INTERNAL_ERROR;
-        }
-        constexpr std::uint32_t threads = kThreads256;
-        const std::uint32_t density_n   = static_cast<std::uint32_t>(runtime->network.density.gradients.count);
-        const std::uint32_t color_n     = static_cast<std::uint32_t>(runtime->network.color.gradients.count);
-        if (density_n != 0u) {
-            nerf::runtime::k_accum_grad_stats_half<<<(density_n + threads - 1u) / threads, threads, 0, runtime->stream>>>(runtime->network.density.gradients.ptr, density_n, runtime->workspace.grad_sumsq, runtime->workspace.nonfinite_flag);
-        }
-        if (color_n != 0u) {
-            nerf::runtime::k_accum_grad_stats_half<<<(color_n + threads - 1u) / threads, threads, 0, runtime->stream>>>(runtime->network.color.gradients.ptr, color_n, runtime->workspace.grad_sumsq, runtime->workspace.nonfinite_flag);
-        }
-        if (cudaGetLastError() != cudaSuccess) return NERF_STATUS_INTERNAL_ERROR;
+    nerf::network::NetworkTrainingRequest training_request{};
+    training_request.sample_rays  = runtime->training_request.sample_rays;
+    training_request.sample_steps = runtime->training_request.sample_steps;
+    training_request.batch_state  = runtime->training_request.batch_state;
+    training_request.ray_count    = host_batch_state.active_ray_count;
+    training_request.sample_count = host_batch_state.sample_step_count;
+    if (training_request.ray_count != 0u && training_request.sample_count != 0u) {
+        if (!nerf::network::run_network_training(runtime->network, runtime->workspace, runtime->stream, training_request)) return NERF_STATUS_INTERNAL_ERROR;
     }
+    constexpr std::uint32_t threads = kThreads256;
+    const std::uint32_t density_n   = static_cast<std::uint32_t>(runtime->network.density.gradients.count);
+    const std::uint32_t color_n     = static_cast<std::uint32_t>(runtime->network.color.gradients.count);
+    if (density_n != 0u) {
+        nerf::runtime::k_accum_grad_stats_half<<<(density_n + threads - 1u) / threads, threads, 0, runtime->stream>>>(runtime->network.density.gradients.ptr, density_n, runtime->workspace.grad_sumsq, runtime->workspace.nonfinite_flag);
+    }
+    if (color_n != 0u) {
+        nerf::runtime::k_accum_grad_stats_half<<<(color_n + threads - 1u) / threads, threads, 0, runtime->stream>>>(runtime->network.color.gradients.ptr, color_n, runtime->workspace.grad_sumsq, runtime->workspace.nonfinite_flag);
+    }
+    if (cudaGetLastError() != cudaSuccess) return NERF_STATUS_INTERNAL_ERROR;
 
     nerf::runtime::k_finalize_training_stats<<<1, 1, 0, runtime->stream>>>(runtime->device_state, runtime->training_request.batch_state, runtime->workspace.loss_sum, runtime->workspace.grad_sumsq, runtime->workspace.nonfinite_flag);
     if (cudaGetLastError() != cudaSuccess) return NERF_STATUS_INTERNAL_ERROR;
