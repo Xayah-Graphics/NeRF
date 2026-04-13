@@ -1,29 +1,22 @@
 #include "nerf.h"
-
-#define STB_IMAGE_IMPLEMENTATION
-#include "stb/stb_image.h"
 #include <algorithm>
-#include <atomic>
 #include <bit>
 #include <cmath>
 #include <cstddef>
 #include <cublas_v2.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
-#include <filesystem>
 #include <fstream>
 #include <limits>
 #include <memory>
 #include <mma.h>
 #include <mutex>
 #include <string>
-#include <system_error>
-#include <thread>
 #include <type_traits>
 #include <vector>
 #include <vector_types.h>
 
-#include "json/json.hpp"
+#include "json.hpp"
 
 constexpr std::uint32_t kMaxSampleStepsPerRay = 256u;
 
@@ -83,15 +76,21 @@ constexpr float kUpdateGuardGradNorm = 100.0f;
 constexpr float kInvLossScale        = 1.0f / kNetworkLossScale;
 
 namespace nerf::host {
-    struct HostDatasetData {
-        std::vector<std::uint8_t> images_rgba8{};
-        std::vector<float> c2w_4x4{};
-        NerfDatasetInfo info{};
-    };
-
     struct HostCheckpointData {
         std::vector<float> density_params_f32{};
         std::vector<float> color_params_f32{};
+    };
+
+    struct DatasetInfo {
+        uint32_t image_count;
+        uint32_t image_width;
+        uint32_t image_height;
+        uint64_t images_bytes;
+        uint64_t c2w_bytes;
+        float fx;
+        float fy;
+        float cx;
+        float cy;
     };
 } // namespace nerf::host
 
@@ -265,413 +264,6 @@ namespace nerf::network {
 namespace nerf::io {
     static_assert(std::endian::native == std::endian::little);
 
-    NerfStatus load_dataset_host_data(const NerfDatasetLoadDesc& desc, nerf::host::HostDatasetData& out_data) {
-        if (!desc.path_utf8) return NERF_STATUS_INVALID_ARGUMENT;
-        if (!std::isfinite(desc.scale) || !(desc.scale > 0.0f)) return NERF_STATUS_INVALID_ARGUMENT;
-        if (!std::isfinite(desc.offset.x) || !std::isfinite(desc.offset.y) || !std::isfinite(desc.offset.z)) return NERF_STATUS_INVALID_ARGUMENT;
-
-        const NerfCoordBasis basis_list[] = {
-            desc.source_system.world,
-            desc.source_system.camera,
-            desc.target_system.world,
-            desc.target_system.camera,
-        };
-        for (const NerfCoordBasis& basis : basis_list) {
-            const std::uint32_t dirs[] = {basis.x, basis.y, basis.z};
-            std::uint32_t seen_axes    = 0u;
-            for (const std::uint32_t dir : dirs) {
-                std::uint32_t axis = 0u;
-                switch (dir) {
-                case NERF_COORD_AXIS_POSITIVE_X:
-                case NERF_COORD_AXIS_NEGATIVE_X: axis = 0u; break;
-                case NERF_COORD_AXIS_POSITIVE_Y:
-                case NERF_COORD_AXIS_NEGATIVE_Y: axis = 1u; break;
-                case NERF_COORD_AXIS_POSITIVE_Z:
-                case NERF_COORD_AXIS_NEGATIVE_Z: axis = 2u; break;
-                default: return NERF_STATUS_INVALID_ARGUMENT;
-                }
-                if ((seen_axes & 1u << axis) != 0u) return NERF_STATUS_INVALID_ARGUMENT;
-                seen_axes |= 1u << axis;
-            }
-            if (seen_axes != 0x7u) return NERF_STATUS_INVALID_ARGUMENT;
-        }
-
-        std::filesystem::path root{desc.path_utf8};
-        std::filesystem::path json_path = root;
-        if (!json_path.has_extension() || json_path.extension() != ".json") json_path = root / "transforms_train.json";
-
-        std::ifstream json_file(json_path, std::ios::binary);
-        if (!json_file) return NERF_STATUS_FILE_NOT_FOUND;
-
-        nlohmann::json json_value;
-        try {
-            json_file >> json_value;
-        } catch (...) {
-            return NERF_STATUS_JSON_PARSE_FAILED;
-        }
-
-        if (!json_value.contains("camera_angle_x")) return NERF_STATUS_MISSING_REQUIRED_FIELD;
-        if (!json_value.contains("frames")) return NERF_STATUS_MISSING_REQUIRED_FIELD;
-
-        float camera_angle_x = 0.0f;
-        try {
-            camera_angle_x = json_value.at("camera_angle_x").get<float>();
-        } catch (...) {
-            return NERF_STATUS_MISSING_REQUIRED_FIELD;
-        }
-        if (!std::isfinite(camera_angle_x)) return NERF_STATUS_INVALID_TRANSFORM_MATRIX;
-
-        if (!json_value.at("frames").is_array() || json_value.at("frames").empty()) return NERF_STATUS_MISSING_REQUIRED_FIELD;
-
-        const nlohmann::json& frames  = json_value.at("frames");
-        const std::size_t frame_count = frames.size();
-        if (frame_count > static_cast<std::size_t>(std::numeric_limits<std::uint32_t>::max())) return NERF_STATUS_OVERFLOW;
-
-        std::vector<std::filesystem::path> image_paths(frame_count);
-        std::vector<float> row_major_4x4(frame_count * 16u, 0.0f);
-
-        for (std::size_t frame_index = 0u; frame_index < frame_count; ++frame_index) {
-            const nlohmann::json& frame = frames[frame_index];
-            if (!frame.contains("file_path")) return NERF_STATUS_MISSING_REQUIRED_FIELD;
-            if (!frame.contains("transform_matrix")) return NERF_STATUS_MISSING_REQUIRED_FIELD;
-
-            try {
-                std::filesystem::path image_path = json_path.parent_path() / frame.at("file_path").get<std::string>();
-                if (!image_path.has_extension()) image_path.replace_extension(".png");
-                std::error_code ec;
-                image_path = std::filesystem::absolute(image_path, ec);
-                if (ec) return NERF_STATUS_FILE_NOT_FOUND;
-                image_path = std::filesystem::weakly_canonical(image_path, ec);
-                if (ec) return NERF_STATUS_FILE_NOT_FOUND;
-                image_paths[frame_index] = std::move(image_path);
-            } catch (...) {
-                return NERF_STATUS_MISSING_REQUIRED_FIELD;
-            }
-
-            try {
-                for (std::size_t r = 0u; r < 4u; ++r) {
-                    for (std::size_t c = 0u; c < 4u; ++c) {
-                        const float value = frame.at("transform_matrix").at(r).at(c).get<float>();
-                        if (!std::isfinite(value)) return NERF_STATUS_INVALID_TRANSFORM_MATRIX;
-                        row_major_4x4[frame_index * 16u + r * 4u + c] = value;
-                    }
-                }
-            } catch (...) {
-                return NERF_STATUS_INVALID_TRANSFORM_MATRIX;
-            }
-        }
-
-        std::error_code image_ec{};
-        if (!std::filesystem::is_regular_file(image_paths[0], image_ec) || image_ec) return NERF_STATUS_FILE_NOT_FOUND;
-
-        int first_width       = 0;
-        int first_height      = 0;
-        int first_channels    = 0;
-        stbi_uc* first_pixels = stbi_load(image_paths[0].string().c_str(), &first_width, &first_height, &first_channels, 4);
-        if (!first_pixels) return NERF_STATUS_IMAGE_LOAD_FAILED;
-        if (first_width <= 0 || first_height <= 0) {
-            stbi_image_free(first_pixels);
-            return NERF_STATUS_IMAGE_LOAD_FAILED;
-        }
-
-        const std::uint64_t image_count_u64 = frame_count;
-        std::uint64_t image_bytes           = image_count_u64;
-        if (image_bytes > std::numeric_limits<std::uint64_t>::max() / 4u) {
-            stbi_image_free(first_pixels);
-            return NERF_STATUS_OVERFLOW;
-        }
-        image_bytes *= 4u;
-        if (image_bytes > std::numeric_limits<std::uint64_t>::max() / static_cast<std::uint64_t>(first_width)) {
-            stbi_image_free(first_pixels);
-            return NERF_STATUS_OVERFLOW;
-        }
-        image_bytes *= static_cast<std::uint64_t>(first_width);
-        if (image_bytes > std::numeric_limits<std::uint64_t>::max() / static_cast<std::uint64_t>(first_height)) {
-            stbi_image_free(first_pixels);
-            return NERF_STATUS_OVERFLOW;
-        }
-        image_bytes *= static_cast<std::uint64_t>(first_height);
-
-        const std::uint64_t bytes_per_image = static_cast<std::uint64_t>(first_width) * static_cast<std::uint64_t>(first_height) * 4u;
-        const float width_f                 = static_cast<float>(first_width);
-        const float height_f                = static_cast<float>(first_height);
-        const float fx                      = 0.5f * width_f / std::tan(camera_angle_x * 0.5f);
-        const float fy                      = fx;
-        const float cx                      = 0.5f * (width_f - 1.0f);
-        const float cy                      = 0.5f * (height_f - 1.0f);
-
-        std::vector<std::uint8_t> host_images_rgba8(image_bytes);
-        std::memcpy(host_images_rgba8.data(), first_pixels, bytes_per_image);
-        stbi_image_free(first_pixels);
-
-        std::atomic<std::size_t> next_image_index{1u};
-        std::atomic<int> decode_failure{NERF_STATUS_OK};
-        std::size_t worker_count = 0u;
-        if (frame_count > 1u) {
-            const std::size_t hardware_threads = std::max<std::size_t>(1u, std::thread::hardware_concurrency());
-            worker_count                       = std::min<std::size_t>(frame_count - 1u, hardware_threads > 1u ? hardware_threads - 1u : 1u);
-        }
-
-        std::vector<std::jthread> workers{};
-        workers.reserve(worker_count);
-        for (std::size_t worker_index = 0u; worker_index < worker_count; ++worker_index) {
-            workers.emplace_back([&host_images_rgba8, &image_paths, &next_image_index, &decode_failure, bytes_per_image, first_width, first_height]() {
-                while (true) {
-                    if (decode_failure.load(std::memory_order_relaxed) != static_cast<int>(NERF_STATUS_OK)) return;
-
-                    const std::size_t image_index = next_image_index.fetch_add(1u, std::memory_order_relaxed);
-                    if (image_index >= image_paths.size()) return;
-
-                    std::error_code local_ec{};
-                    if (!std::filesystem::is_regular_file(image_paths[image_index], local_ec) || local_ec) {
-                        decode_failure.store(NERF_STATUS_FILE_NOT_FOUND, std::memory_order_relaxed);
-                        return;
-                    }
-
-                    int width       = 0;
-                    int height      = 0;
-                    int channels    = 0;
-                    stbi_uc* pixels = stbi_load(image_paths[image_index].string().c_str(), &width, &height, &channels, 4);
-                    if (!pixels) {
-                        decode_failure.store(NERF_STATUS_IMAGE_LOAD_FAILED, std::memory_order_relaxed);
-                        return;
-                    }
-                    if (width != first_width || height != first_height) {
-                        stbi_image_free(pixels);
-                        decode_failure.store(NERF_STATUS_INCONSISTENT_IMAGE_RESOLUTION, std::memory_order_relaxed);
-                        return;
-                    }
-
-                    std::memcpy(host_images_rgba8.data() + image_index * bytes_per_image, pixels, bytes_per_image);
-                    stbi_image_free(pixels);
-                }
-            });
-        }
-        workers.clear();
-
-        if (decode_failure.load(std::memory_order_relaxed) != static_cast<int>(NERF_STATUS_OK)) {
-            return static_cast<NerfStatus>(decode_failure.load(std::memory_order_relaxed));
-        }
-
-        std::vector<float> host_c2w_4x4(frame_count * 16u, 0.0f);
-
-        float src_world_basis[9]  = {};
-        float src_camera_basis[9] = {};
-        float dst_world_basis[9]  = {};
-        float dst_camera_basis[9] = {};
-
-        const std::uint32_t src_world_dirs[]  = {desc.source_system.world.x, desc.source_system.world.y, desc.source_system.world.z};
-        const std::uint32_t src_camera_dirs[] = {desc.source_system.camera.x, desc.source_system.camera.y, desc.source_system.camera.z};
-        const std::uint32_t dst_world_dirs[]  = {desc.target_system.world.x, desc.target_system.world.y, desc.target_system.world.z};
-        const std::uint32_t dst_camera_dirs[] = {desc.target_system.camera.x, desc.target_system.camera.y, desc.target_system.camera.z};
-
-        for (std::size_t c = 0u; c < 3u; ++c) {
-            std::uint32_t src_world_axis  = 0u;
-            std::uint32_t src_camera_axis = 0u;
-            std::uint32_t dst_world_axis  = 0u;
-            std::uint32_t dst_camera_axis = 0u;
-            float src_world_sign          = 0.0f;
-            float src_camera_sign         = 0.0f;
-            float dst_world_sign          = 0.0f;
-            float dst_camera_sign         = 0.0f;
-
-            switch (src_world_dirs[c]) {
-            case NERF_COORD_AXIS_POSITIVE_X:
-                src_world_axis = 0u;
-                src_world_sign = 1.0f;
-                break;
-            case NERF_COORD_AXIS_NEGATIVE_X:
-                src_world_axis = 0u;
-                src_world_sign = -1.0f;
-                break;
-            case NERF_COORD_AXIS_POSITIVE_Y:
-                src_world_axis = 1u;
-                src_world_sign = 1.0f;
-                break;
-            case NERF_COORD_AXIS_NEGATIVE_Y:
-                src_world_axis = 1u;
-                src_world_sign = -1.0f;
-                break;
-            case NERF_COORD_AXIS_POSITIVE_Z:
-                src_world_axis = 2u;
-                src_world_sign = 1.0f;
-                break;
-            case NERF_COORD_AXIS_NEGATIVE_Z:
-                src_world_axis = 2u;
-                src_world_sign = -1.0f;
-                break;
-            default: return NERF_STATUS_INVALID_ARGUMENT;
-            }
-            switch (src_camera_dirs[c]) {
-            case NERF_COORD_AXIS_POSITIVE_X:
-                src_camera_axis = 0u;
-                src_camera_sign = 1.0f;
-                break;
-            case NERF_COORD_AXIS_NEGATIVE_X:
-                src_camera_axis = 0u;
-                src_camera_sign = -1.0f;
-                break;
-            case NERF_COORD_AXIS_POSITIVE_Y:
-                src_camera_axis = 1u;
-                src_camera_sign = 1.0f;
-                break;
-            case NERF_COORD_AXIS_NEGATIVE_Y:
-                src_camera_axis = 1u;
-                src_camera_sign = -1.0f;
-                break;
-            case NERF_COORD_AXIS_POSITIVE_Z:
-                src_camera_axis = 2u;
-                src_camera_sign = 1.0f;
-                break;
-            case NERF_COORD_AXIS_NEGATIVE_Z:
-                src_camera_axis = 2u;
-                src_camera_sign = -1.0f;
-                break;
-            default: return NERF_STATUS_INVALID_ARGUMENT;
-            }
-            switch (dst_world_dirs[c]) {
-            case NERF_COORD_AXIS_POSITIVE_X:
-                dst_world_axis = 0u;
-                dst_world_sign = 1.0f;
-                break;
-            case NERF_COORD_AXIS_NEGATIVE_X:
-                dst_world_axis = 0u;
-                dst_world_sign = -1.0f;
-                break;
-            case NERF_COORD_AXIS_POSITIVE_Y:
-                dst_world_axis = 1u;
-                dst_world_sign = 1.0f;
-                break;
-            case NERF_COORD_AXIS_NEGATIVE_Y:
-                dst_world_axis = 1u;
-                dst_world_sign = -1.0f;
-                break;
-            case NERF_COORD_AXIS_POSITIVE_Z:
-                dst_world_axis = 2u;
-                dst_world_sign = 1.0f;
-                break;
-            case NERF_COORD_AXIS_NEGATIVE_Z:
-                dst_world_axis = 2u;
-                dst_world_sign = -1.0f;
-                break;
-            default: return NERF_STATUS_INVALID_ARGUMENT;
-            }
-            switch (dst_camera_dirs[c]) {
-            case NERF_COORD_AXIS_POSITIVE_X:
-                dst_camera_axis = 0u;
-                dst_camera_sign = 1.0f;
-                break;
-            case NERF_COORD_AXIS_NEGATIVE_X:
-                dst_camera_axis = 0u;
-                dst_camera_sign = -1.0f;
-                break;
-            case NERF_COORD_AXIS_POSITIVE_Y:
-                dst_camera_axis = 1u;
-                dst_camera_sign = 1.0f;
-                break;
-            case NERF_COORD_AXIS_NEGATIVE_Y:
-                dst_camera_axis = 1u;
-                dst_camera_sign = -1.0f;
-                break;
-            case NERF_COORD_AXIS_POSITIVE_Z:
-                dst_camera_axis = 2u;
-                dst_camera_sign = 1.0f;
-                break;
-            case NERF_COORD_AXIS_NEGATIVE_Z:
-                dst_camera_axis = 2u;
-                dst_camera_sign = -1.0f;
-                break;
-            default: return NERF_STATUS_INVALID_ARGUMENT;
-            }
-
-            src_world_basis[src_world_axis * 3u + c]   = src_world_sign;
-            src_camera_basis[src_camera_axis * 3u + c] = src_camera_sign;
-            dst_world_basis[dst_world_axis * 3u + c]   = dst_world_sign;
-            dst_camera_basis[dst_camera_axis * 3u + c] = dst_camera_sign;
-        }
-
-        float world_map[9]  = {};
-        float camera_map[9] = {};
-        for (std::size_t r = 0u; r < 3u; ++r) {
-            for (std::size_t c = 0u; c < 3u; ++c) {
-                for (std::size_t k = 0u; k < 3u; ++k) {
-                    world_map[r * 3u + c] += dst_world_basis[k * 3u + r] * src_world_basis[k * 3u + c];
-                    camera_map[r * 3u + c] += src_camera_basis[k * 3u + r] * dst_camera_basis[k * 3u + c];
-                }
-            }
-        }
-
-        for (std::size_t frame_index = 0u; frame_index < frame_count; ++frame_index) {
-            const float* row_major = row_major_4x4.data() + frame_index * 16u;
-
-            const float src_rot[9] = {
-                row_major[0],
-                row_major[1],
-                row_major[2],
-                row_major[4],
-                row_major[5],
-                row_major[6],
-                row_major[8],
-                row_major[9],
-                row_major[10],
-            };
-            const float src_translation[3] = {row_major[3], row_major[7], row_major[11]};
-
-            float tmp_rot[9]         = {};
-            float dst_rot[9]         = {};
-            float dst_translation[3] = {};
-
-            for (std::size_t r = 0u; r < 3u; ++r) {
-                for (std::size_t c = 0u; c < 3u; ++c) {
-                    for (std::size_t k = 0u; k < 3u; ++k) tmp_rot[r * 3u + c] += world_map[r * 3u + k] * src_rot[k * 3u + c];
-                }
-            }
-            for (std::size_t r = 0u; r < 3u; ++r) {
-                for (std::size_t c = 0u; c < 3u; ++c) {
-                    for (std::size_t k = 0u; k < 3u; ++k) dst_rot[r * 3u + c] += tmp_rot[r * 3u + k] * camera_map[k * 3u + c];
-                }
-            }
-            for (std::size_t r = 0u; r < 3u; ++r) {
-                for (std::size_t k = 0u; k < 3u; ++k) dst_translation[r] += world_map[r * 3u + k] * src_translation[k];
-            }
-
-            float* packed = host_c2w_4x4.data() + frame_index * 16u;
-            packed[0]     = dst_rot[0];
-            packed[1]     = dst_rot[3];
-            packed[2]     = dst_rot[6];
-            packed[3]     = fx;
-            packed[4]     = dst_rot[1];
-            packed[5]     = dst_rot[4];
-            packed[6]     = dst_rot[7];
-            packed[7]     = fy;
-            packed[8]     = dst_rot[2];
-            packed[9]     = dst_rot[5];
-            packed[10]    = dst_rot[8];
-            packed[11]    = cx;
-            packed[12]    = dst_translation[0] * desc.scale + desc.offset.x;
-            packed[13]    = dst_translation[1] * desc.scale + desc.offset.y;
-            packed[14]    = dst_translation[2] * desc.scale + desc.offset.z;
-            packed[15]    = cy;
-        }
-
-        out_data.images_rgba8 = std::move(host_images_rgba8);
-        out_data.c2w_4x4      = std::move(host_c2w_4x4);
-        out_data.info         = NerfDatasetInfo{
-                    .image_count   = static_cast<std::uint32_t>(frame_count),
-                    .image_width   = static_cast<std::uint32_t>(first_width),
-                    .image_height  = static_cast<std::uint32_t>(first_height),
-                    .images_bytes  = image_bytes,
-                    .c2w_bytes     = out_data.c2w_4x4.size() * sizeof(float),
-                    .fx            = fx,
-                    .fy            = fy,
-                    .cx            = cx,
-                    .cy            = cy,
-                    .source_system = desc.source_system,
-                    .target_system = desc.target_system,
-        };
-        return NERF_STATUS_OK;
-    }
-
     NerfStatus save_network_checkpoint_file(const NerfCheckpointFileDesc& desc, const nerf::network::NetworkCheckpointLayout& layout, const nerf::host::HostCheckpointData& data) {
         if (!desc.path_utf8) return NERF_STATUS_INVALID_ARGUMENT;
         if (layout.tensor_count == 0u) return NERF_STATUS_CHECKPOINT_MISMATCH;
@@ -730,7 +322,7 @@ namespace nerf::io {
         if (layout.tensor_count == 0u) return NERF_STATUS_CHECKPOINT_MISMATCH;
 
         std::ifstream file(desc.path_utf8, std::ios::binary);
-        if (!file) return NERF_STATUS_FILE_NOT_FOUND;
+        if (!file) return NERF_STATUS_CHECKPOINT_INVALID;
 
         file.seekg(0, std::ios::end);
         const std::uint64_t file_size = file.tellg();
@@ -2121,7 +1713,7 @@ namespace nerf::runtime {
         DeviceSpan sample_rays{};
         DeviceSpan sample_steps{};
         DeviceSpan sample_batch_state{};
-        NerfDatasetInfo dataset_info{};
+        nerf::host::DatasetInfo dataset_info{};
         std::uint32_t occupancy_grid_res    = 0u;
         std::uint32_t max_sample_steps      = 0u;
         std::uint32_t max_batch_rays        = 0u;
@@ -2585,9 +2177,125 @@ namespace nerf::runtime {
     }
 } // namespace nerf::runtime
 
+static NerfStatus upload_dataset_from_create_desc(nerf::runtime::ContextStorage* ctx, const NerfCreateDesc& desc, nerf::host::DatasetInfo* out_info) {
+    if (!ctx) return NERF_STATUS_INVALID_ARGUMENT;
+    if (!desc.images_rgba8) return NERF_STATUS_INVALID_ARGUMENT;
+    if (!desc.cameras_4x4_packed) return NERF_STATUS_INVALID_ARGUMENT;
+    if (desc.image_count == 0u) return NERF_STATUS_INVALID_ARGUMENT;
+    if (desc.image_width == 0u) return NERF_STATUS_INVALID_ARGUMENT;
+    if (desc.image_height == 0u) return NERF_STATUS_INVALID_ARGUMENT;
+    if (!std::isfinite(desc.fx) || !(desc.fx > 0.0f)) return NERF_STATUS_INVALID_ARGUMENT;
+    if (!std::isfinite(desc.fy) || !(desc.fy > 0.0f)) return NERF_STATUS_INVALID_ARGUMENT;
+    if (!std::isfinite(desc.cx)) return NERF_STATUS_INVALID_ARGUMENT;
+    if (!std::isfinite(desc.cy)) return NERF_STATUS_INVALID_ARGUMENT;
+
+    const auto safe_mul_u64 = [](const std::uint64_t a, const std::uint64_t b, std::uint64_t* out) -> bool {
+        if (!out) return false;
+        if (a != 0u && b > std::numeric_limits<std::uint64_t>::max() / a) return false;
+        *out = a * b;
+        return true;
+    };
+
+    std::uint64_t expected_images_bytes = static_cast<std::uint64_t>(desc.image_count);
+    if (!safe_mul_u64(expected_images_bytes, static_cast<std::uint64_t>(desc.image_width), &expected_images_bytes)) return NERF_STATUS_OVERFLOW;
+    if (!safe_mul_u64(expected_images_bytes, static_cast<std::uint64_t>(desc.image_height), &expected_images_bytes)) return NERF_STATUS_OVERFLOW;
+    if (!safe_mul_u64(expected_images_bytes, 4u, &expected_images_bytes)) return NERF_STATUS_OVERFLOW;
+
+    std::uint64_t expected_cameras_bytes = static_cast<std::uint64_t>(desc.image_count);
+    if (!safe_mul_u64(expected_cameras_bytes, 16u, &expected_cameras_bytes)) return NERF_STATUS_OVERFLOW;
+    if (!safe_mul_u64(expected_cameras_bytes, sizeof(float), &expected_cameras_bytes)) return NERF_STATUS_OVERFLOW;
+
+    if (desc.images_bytes != expected_images_bytes) return NERF_STATUS_INVALID_ARGUMENT;
+    if (desc.cameras_bytes != expected_cameras_bytes) return NERF_STATUS_INVALID_ARGUMENT;
+
+    const std::uint64_t camera_f32_count = desc.cameras_bytes / sizeof(float);
+    for (std::uint64_t i = 0u; i < camera_f32_count; ++i) {
+        if (!std::isfinite(desc.cameras_4x4_packed[i])) return NERF_STATUS_INVALID_ARGUMENT;
+    }
+
+    {
+        std::scoped_lock lock(ctx->cuda_context->train_runtime_mutex);
+        std::shared_ptr<nerf::runtime::TrainRuntime> runtime = ctx->cuda_context->train_runtime;
+        runtime->training_configured                         = false;
+        runtime->host_frame_index                            = 0u;
+    }
+
+    if (ctx->scene_device_base) {
+        if (cudaFree(ctx->scene_device_base) != cudaSuccess) return NERF_STATUS_CUDA_FAILURE;
+        ctx->scene_device_base = nullptr;
+    }
+    ctx->images = {};
+    ctx->xforms = {};
+
+    std::uint64_t cursor = 0u;
+    nerf::runtime::Region images{};
+    nerf::runtime::Region xforms{};
+    {
+        if (ctx->arena_alignment_bytes > 1u) {
+            if (cursor > std::numeric_limits<std::uint64_t>::max() - (ctx->arena_alignment_bytes - 1u)) return NERF_STATUS_OVERFLOW;
+            cursor = cursor + ctx->arena_alignment_bytes - 1u & ~(ctx->arena_alignment_bytes - 1u);
+        }
+        images.offset_bytes = cursor;
+        images.size_bytes   = desc.images_bytes;
+        if (cursor > std::numeric_limits<std::uint64_t>::max() - images.size_bytes) return NERF_STATUS_OVERFLOW;
+        cursor += images.size_bytes;
+
+        if (ctx->arena_alignment_bytes > 1u) {
+            if (cursor > std::numeric_limits<std::uint64_t>::max() - (ctx->arena_alignment_bytes - 1u)) return NERF_STATUS_OVERFLOW;
+            cursor = cursor + ctx->arena_alignment_bytes - 1u & ~(ctx->arena_alignment_bytes - 1u);
+        }
+        xforms.offset_bytes = cursor;
+        xforms.size_bytes   = desc.cameras_bytes;
+        if (cursor > std::numeric_limits<std::uint64_t>::max() - xforms.size_bytes) return NERF_STATUS_OVERFLOW;
+        cursor += xforms.size_bytes;
+    }
+
+    void* scene_ptr                = nullptr;
+    const cudaError_t alloc_status = cudaMalloc(&scene_ptr, cursor);
+    if (alloc_status != cudaSuccess) {
+        if (alloc_status == cudaErrorMemoryAllocation) return NERF_STATUS_OUT_OF_MEMORY;
+        return NERF_STATUS_CUDA_FAILURE;
+    }
+
+    ctx->scene_device_base = static_cast<std::byte*>(scene_ptr);
+    ctx->images.ptr        = ctx->scene_device_base + images.offset_bytes;
+    ctx->images.size_bytes = images.size_bytes;
+    ctx->xforms.ptr        = ctx->scene_device_base + xforms.offset_bytes;
+    ctx->xforms.size_bytes = xforms.size_bytes;
+
+    if (cudaMemcpy(ctx->images.ptr, desc.images_rgba8, ctx->images.size_bytes, cudaMemcpyHostToDevice) != cudaSuccess) {
+        cudaFree(ctx->scene_device_base);
+        ctx->scene_device_base = nullptr;
+        ctx->images            = {};
+        ctx->xforms            = {};
+        return NERF_STATUS_CUDA_FAILURE;
+    }
+    if (cudaMemcpy(ctx->xforms.ptr, desc.cameras_4x4_packed, ctx->xforms.size_bytes, cudaMemcpyHostToDevice) != cudaSuccess) {
+        cudaFree(ctx->scene_device_base);
+        ctx->scene_device_base = nullptr;
+        ctx->images            = {};
+        ctx->xforms            = {};
+        return NERF_STATUS_CUDA_FAILURE;
+    }
+
+    ctx->dataset_info.image_count  = desc.image_count;
+    ctx->dataset_info.image_width  = desc.image_width;
+    ctx->dataset_info.image_height = desc.image_height;
+    ctx->dataset_info.images_bytes = desc.images_bytes;
+    ctx->dataset_info.c2w_bytes    = desc.cameras_bytes;
+    ctx->dataset_info.fx           = desc.fx;
+    ctx->dataset_info.fy           = desc.fy;
+    ctx->dataset_info.cx           = desc.cx;
+    ctx->dataset_info.cy           = desc.cy;
+
+    if (out_info) *out_info = ctx->dataset_info;
+    return NERF_STATUS_OK;
+}
+
 extern "C" {
 NerfStatus nerf_create_context(const NerfCreateDesc* desc, void** out_context) {
     if (!desc || !out_context) return NERF_STATUS_INVALID_ARGUMENT;
+    *out_context = nullptr;
 
     const NerfCreateDesc normalized = *desc;
     if (normalized.occupancy_grid_res == 0u) return NERF_STATUS_INVALID_ARGUMENT;
@@ -2712,6 +2420,30 @@ NerfStatus nerf_create_context(const NerfCreateDesc* desc, void** out_context) {
         context->cuda_context->train_runtime = std::move(runtime);
     }
 
+    const NerfStatus upload_status = upload_dataset_from_create_desc(context.get(), normalized, &context->dataset_info);
+    if (upload_status != NERF_STATUS_OK) {
+        std::shared_ptr<nerf::runtime::TrainRuntime> runtime;
+        {
+            std::scoped_lock lock(context->cuda_context->train_runtime_mutex);
+            runtime = std::move(context->cuda_context->train_runtime);
+        }
+        if (runtime) {
+            std::scoped_lock run_lock(runtime->run_mutex);
+            nerf::runtime::destroy_runtime(*runtime);
+        }
+        if (context->scene_device_base) {
+            (void) cudaFree(context->scene_device_base);
+            context->scene_device_base = nullptr;
+        }
+        if (context->scratch_device_base) {
+            (void) cudaFree(context->scratch_device_base);
+            context->scratch_device_base = nullptr;
+        }
+        delete context->cuda_context;
+        context->cuda_context = nullptr;
+        return upload_status;
+    }
+
     *out_context = context.release();
     return NERF_STATUS_OK;
 }
@@ -2746,88 +2478,12 @@ NerfStatus nerf_destroy_context(void* context) {
     return status;
 }
 
-NerfStatus nerf_load_dataset(void* context, const NerfDatasetLoadDesc* desc, NerfDatasetInfo* out_info) {
-    if (!context || !desc) return NERF_STATUS_INVALID_ARGUMENT;
-
-    nerf::host::HostDatasetData host_data{};
-    const NerfStatus load_status = nerf::io::load_dataset_host_data(*desc, host_data);
-    if (load_status != NERF_STATUS_OK) return load_status;
-
-    nerf::runtime::ContextStorage* ctx = static_cast<nerf::runtime::ContextStorage*>(context);
-    {
-        std::scoped_lock lock(ctx->cuda_context->train_runtime_mutex);
-        std::shared_ptr<nerf::runtime::TrainRuntime> runtime = ctx->cuda_context->train_runtime;
-        runtime->training_configured                         = false;
-        runtime->host_frame_index                            = 0u;
-    }
-
-    if (ctx->scene_device_base) {
-        if (cudaFree(ctx->scene_device_base) != cudaSuccess) return NERF_STATUS_CUDA_FAILURE;
-        ctx->scene_device_base = nullptr;
-    }
-
-    std::uint64_t cursor = 0u;
-    nerf::runtime::Region images{};
-    nerf::runtime::Region xforms{};
-    {
-        if (ctx->arena_alignment_bytes > 1u) {
-            if (cursor > std::numeric_limits<std::uint64_t>::max() - (ctx->arena_alignment_bytes - 1u)) return NERF_STATUS_OVERFLOW;
-            cursor = cursor + ctx->arena_alignment_bytes - 1u & ~(ctx->arena_alignment_bytes - 1u);
-        }
-        images.offset_bytes = cursor;
-        images.size_bytes   = host_data.info.images_bytes;
-        if (cursor > std::numeric_limits<std::uint64_t>::max() - images.size_bytes) return NERF_STATUS_OVERFLOW;
-        cursor += images.size_bytes;
-
-        if (ctx->arena_alignment_bytes > 1u) {
-            if (cursor > std::numeric_limits<std::uint64_t>::max() - (ctx->arena_alignment_bytes - 1u)) return NERF_STATUS_OVERFLOW;
-            cursor = cursor + ctx->arena_alignment_bytes - 1u & ~(ctx->arena_alignment_bytes - 1u);
-        }
-        xforms.offset_bytes = cursor;
-        xforms.size_bytes   = host_data.info.c2w_bytes;
-        if (cursor > std::numeric_limits<std::uint64_t>::max() - xforms.size_bytes) return NERF_STATUS_OVERFLOW;
-        cursor += xforms.size_bytes;
-    }
-
-    void* scene_ptr                = nullptr;
-    const cudaError_t alloc_status = cudaMalloc(&scene_ptr, cursor);
-    if (alloc_status != cudaSuccess) {
-        if (alloc_status == cudaErrorMemoryAllocation) return NERF_STATUS_OUT_OF_MEMORY;
-        return NERF_STATUS_CUDA_FAILURE;
-    }
-
-    ctx->scene_device_base = static_cast<std::byte*>(scene_ptr);
-    ctx->images.ptr        = ctx->scene_device_base + images.offset_bytes;
-    ctx->images.size_bytes = images.size_bytes;
-    ctx->xforms.ptr        = ctx->scene_device_base + xforms.offset_bytes;
-    ctx->xforms.size_bytes = xforms.size_bytes;
-
-    if (cudaMemcpy(ctx->images.ptr, host_data.images_rgba8.data(), ctx->images.size_bytes, cudaMemcpyHostToDevice) != cudaSuccess) {
-        cudaFree(ctx->scene_device_base);
-        ctx->scene_device_base = nullptr;
-        ctx->images            = {};
-        ctx->xforms            = {};
-        return NERF_STATUS_CUDA_FAILURE;
-    }
-    if (cudaMemcpy(ctx->xforms.ptr, host_data.c2w_4x4.data(), ctx->xforms.size_bytes, cudaMemcpyHostToDevice) != cudaSuccess) {
-        cudaFree(ctx->scene_device_base);
-        ctx->scene_device_base = nullptr;
-        ctx->images            = {};
-        ctx->xforms            = {};
-        return NERF_STATUS_CUDA_FAILURE;
-    }
-
-    ctx->dataset_info = host_data.info;
-
-    if (out_info) *out_info = ctx->dataset_info;
-    return NERF_STATUS_OK;
-}
 
 NerfStatus nerf_configure_training(void* context, const NerfTrainingConfig* config) {
     if (!context || !config) return NERF_STATUS_INVALID_ARGUMENT;
 
     const NerfTrainingConfig normalized = *config;
-    if (!(normalized.aabb_min.x < normalized.aabb_max.x && normalized.aabb_min.y < normalized.aabb_max.y && normalized.aabb_min.z < normalized.aabb_max.z)) return NERF_STATUS_INVALID_ARGUMENT;
+    if (!(normalized.aabb_min_x < normalized.aabb_max_x && normalized.aabb_min_y < normalized.aabb_max_y && normalized.aabb_min_z < normalized.aabb_max_z)) return NERF_STATUS_INVALID_ARGUMENT;
     if (normalized.occupancy_params.cells_per_update == 0u) return NERF_STATUS_INVALID_ARGUMENT;
     if (normalized.occupancy_params.update_interval == 0u) return NERF_STATUS_INVALID_ARGUMENT;
     if (normalized.rays_per_batch == 0u) return NERF_STATUS_INVALID_ARGUMENT;
@@ -2862,8 +2518,8 @@ NerfStatus nerf_configure_training(void* context, const NerfTrainingConfig* conf
         .cells_per_update   = normalized.occupancy_params.cells_per_update,
         .update_interval    = normalized.occupancy_params.update_interval,
         .warmup_steps       = normalized.occupancy_params.warmup_steps,
-        .aabb_min           = float3{normalized.aabb_min.x, normalized.aabb_min.y, normalized.aabb_min.z},
-        .aabb_max           = float3{normalized.aabb_max.x, normalized.aabb_max.y, normalized.aabb_max.z},
+        .aabb_min           = float3{normalized.aabb_min_x, normalized.aabb_min_y, normalized.aabb_min_z},
+        .aabb_max           = float3{normalized.aabb_max_x, normalized.aabb_max_y, normalized.aabb_max_z},
     };
     const nerf::sampler::SamplerRequest sampler_request{
         .stream                   = runtime->stream,
@@ -2879,8 +2535,8 @@ NerfStatus nerf_configure_training(void* context, const NerfTrainingConfig* conf
         .max_sample_step_count    = static_cast<std::uint32_t>(total_sample_steps),
         .image_width              = ctx->dataset_info.image_width,
         .image_height             = ctx->dataset_info.image_height,
-        .aabb_min                 = float3{normalized.aabb_min.x, normalized.aabb_min.y, normalized.aabb_min.z},
-        .aabb_max                 = float3{normalized.aabb_max.x, normalized.aabb_max.y, normalized.aabb_max.z},
+        .aabb_min                 = float3{normalized.aabb_min_x, normalized.aabb_min_y, normalized.aabb_min_z},
+        .aabb_max                 = float3{normalized.aabb_max_x, normalized.aabb_max_y, normalized.aabb_max_z},
     };
     const nerf::runtime::TrainingStepRequest training_request{
         .sample_rays           = reinterpret_cast<const nerf::sampler::SampleRay*>(ctx->sample_rays.ptr),
@@ -2899,8 +2555,8 @@ NerfStatus nerf_configure_training(void* context, const NerfTrainingConfig* conf
     };
     {
         std::scoped_lock run_lock(runtime->run_mutex);
-        const bool same_plan = runtime->training_configured && runtime->training_request.max_sample_step_count == training_request.max_sample_step_count && runtime->occupancy_request.update_rows_padded == occupancy_request.update_rows_padded && runtime->training_config.aabb_min.x == normalized.aabb_min.x && runtime->training_config.aabb_min.y == normalized.aabb_min.y && runtime->training_config.aabb_min.z == normalized.aabb_min.z
-                            && runtime->training_config.aabb_max.x == normalized.aabb_max.x && runtime->training_config.aabb_max.y == normalized.aabb_max.y && runtime->training_config.aabb_max.z == normalized.aabb_max.z && runtime->training_config.hyper_params.learning_rate == normalized.hyper_params.learning_rate && runtime->training_config.hyper_params.adam_beta1 == normalized.hyper_params.adam_beta1
+        const bool same_plan = runtime->training_configured && runtime->training_request.max_sample_step_count == training_request.max_sample_step_count && runtime->occupancy_request.update_rows_padded == occupancy_request.update_rows_padded && runtime->training_config.aabb_min_x == normalized.aabb_min_x && runtime->training_config.aabb_min_y == normalized.aabb_min_y && runtime->training_config.aabb_min_z == normalized.aabb_min_z
+                            && runtime->training_config.aabb_max_x == normalized.aabb_max_x && runtime->training_config.aabb_max_y == normalized.aabb_max_y && runtime->training_config.aabb_max_z == normalized.aabb_max_z && runtime->training_config.hyper_params.learning_rate == normalized.hyper_params.learning_rate && runtime->training_config.hyper_params.adam_beta1 == normalized.hyper_params.adam_beta1
                             && runtime->training_config.hyper_params.adam_beta2 == normalized.hyper_params.adam_beta2 && runtime->training_config.hyper_params.adam_eps == normalized.hyper_params.adam_eps && runtime->training_config.hyper_params.lr_decay_ksteps == normalized.hyper_params.lr_decay_ksteps && runtime->training_config.occupancy_params.decay == normalized.occupancy_params.decay
                             && runtime->training_config.occupancy_params.threshold == normalized.occupancy_params.threshold && runtime->training_config.occupancy_params.cells_per_update == normalized.occupancy_params.cells_per_update && runtime->training_config.occupancy_params.update_interval == normalized.occupancy_params.update_interval && runtime->training_config.occupancy_params.warmup_steps == normalized.occupancy_params.warmup_steps
                             && runtime->training_config.rays_per_batch == normalized.rays_per_batch && runtime->training_config.max_sample_steps_per_ray == normalized.max_sample_steps_per_ray;

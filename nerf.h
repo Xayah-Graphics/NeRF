@@ -26,71 +26,31 @@ extern "C" {
 #endif
 
 
-typedef enum NerfStatus {
-    NERF_STATUS_OK                            = 0,
-    NERF_STATUS_INVALID_ARGUMENT              = 1,
-    NERF_STATUS_OUT_OF_MEMORY                 = 2,
-    NERF_STATUS_CUDA_FAILURE                  = 3,
-    NERF_STATUS_DATASET_NOT_LOADED            = 4,
-    NERF_STATUS_TRAINING_NOT_CONFIGURED       = 5,
-    NERF_STATUS_RANGE_ERROR                   = 6,
-    NERF_STATUS_OVERFLOW                      = 7,
-    NERF_STATUS_INTERNAL_ERROR                = 8,
-    NERF_STATUS_FILE_NOT_FOUND                = 9,
-    NERF_STATUS_JSON_PARSE_FAILED             = 10,
-    NERF_STATUS_MISSING_REQUIRED_FIELD        = 11,
-    NERF_STATUS_INVALID_TRANSFORM_MATRIX      = 12,
-    NERF_STATUS_IMAGE_LOAD_FAILED             = 13,
-    NERF_STATUS_INCONSISTENT_IMAGE_RESOLUTION = 14,
-    NERF_STATUS_CHECKPOINT_INVALID            = 16,
-    NERF_STATUS_CHECKPOINT_MISMATCH           = 17
-} NerfStatus;
+typedef enum NerfStatus { NERF_STATUS_OK = 0, NERF_STATUS_INVALID_ARGUMENT = 1, NERF_STATUS_OUT_OF_MEMORY = 2, NERF_STATUS_CUDA_FAILURE = 3, NERF_STATUS_DATASET_NOT_LOADED = 4, NERF_STATUS_TRAINING_NOT_CONFIGURED = 5, NERF_STATUS_RANGE_ERROR = 6, NERF_STATUS_OVERFLOW = 7, NERF_STATUS_INTERNAL_ERROR = 8, NERF_STATUS_CHECKPOINT_INVALID = 16, NERF_STATUS_CHECKPOINT_MISMATCH = 17 } NerfStatus;
 
 typedef struct NerfCreateDesc {
     uint32_t occupancy_grid_res;
     uint32_t max_sample_steps;
     uint32_t max_batch_rays;
     uint64_t arena_alignment_bytes;
-} NerfCreateDesc;
-NERF_API NerfStatus nerf_create_context(const NerfCreateDesc* desc, void** out_context);
-NERF_API NerfStatus nerf_destroy_context(void* context);
 
-typedef struct NerfVec3 {
-    float x;
-    float y;
-    float z;
-} NerfVec3;
-typedef enum NerfCoordAxis { NERF_COORD_AXIS_POSITIVE_X = 0, NERF_COORD_AXIS_NEGATIVE_X = 1, NERF_COORD_AXIS_POSITIVE_Y = 2, NERF_COORD_AXIS_NEGATIVE_Y = 3, NERF_COORD_AXIS_POSITIVE_Z = 4, NERF_COORD_AXIS_NEGATIVE_Z = 5 } NerfCoordAxis;
-typedef struct NerfCoordBasis {
-    uint32_t x;
-    uint32_t y;
-    uint32_t z;
-} NerfCoordBasis;
-typedef struct NerfCoordSystem {
-    NerfCoordBasis world;
-    NerfCoordBasis camera;
-} NerfCoordSystem;
-typedef struct NerfDatasetLoadDesc {
-    const char* path_utf8;
-    NerfVec3 offset;
-    float scale;
-    NerfCoordSystem source_system;
-    NerfCoordSystem target_system;
-} NerfDatasetLoadDesc;
-typedef struct NerfDatasetInfo {
+    const uint8_t* images_rgba8;
+    uint64_t images_bytes;
+
+    const float* cameras_4x4_packed;
+    uint64_t cameras_bytes;
+
     uint32_t image_count;
     uint32_t image_width;
     uint32_t image_height;
-    uint64_t images_bytes;
-    uint64_t c2w_bytes;
+
     float fx;
     float fy;
     float cx;
     float cy;
-    NerfCoordSystem source_system;
-    NerfCoordSystem target_system;
-} NerfDatasetInfo;
-NERF_API NerfStatus nerf_load_dataset(void* context, const NerfDatasetLoadDesc* desc, NerfDatasetInfo* out_info);
+} NerfCreateDesc;
+NERF_API NerfStatus nerf_create_context(const NerfCreateDesc* desc, void** out_context);
+NERF_API NerfStatus nerf_destroy_context(void* context);
 
 typedef struct NerfHyperParams {
     float learning_rate;
@@ -107,8 +67,12 @@ typedef struct NerfOccupancyParams {
     uint32_t warmup_steps;
 } NerfOccupancyParams;
 typedef struct NerfTrainingConfig {
-    NerfVec3 aabb_min;
-    NerfVec3 aabb_max;
+    float aabb_min_x;
+    float aabb_min_y;
+    float aabb_min_z;
+    float aabb_max_x;
+    float aabb_max_y;
+    float aabb_max_z;
     NerfHyperParams hyper_params;
     NerfOccupancyParams occupancy_params;
     uint32_t rays_per_batch;
