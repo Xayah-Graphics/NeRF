@@ -33,8 +33,6 @@ int main(int argc, char** argv) {
         std::uint32_t rays_per_batch           = kDefaultRays;
         std::uint32_t max_sample_steps_per_ray = kDefaultMaxSampleSteps;
         std::uint32_t log_interval             = kDefaultLogInterval;
-        NerfVec3 aabb_min{0.0f, 0.0f, 0.0f};
-        NerfVec3 aabb_max{1.0f, 1.0f, 1.0f};
         std::filesystem::path load_weights_path{};
         std::filesystem::path save_weights_path{};
     } config{};
@@ -137,8 +135,7 @@ int main(int argc, char** argv) {
             }
         case CliKey::load_weights: config.load_weights_path = value; break;
         case CliKey::save_weights: config.save_weights_path = value; break;
-        case CliKey::help:
-        case CliKey::unknown: break;
+        default: break;
         }
     }
 
@@ -151,10 +148,7 @@ int main(int argc, char** argv) {
         return 2;
     }
 
-    struct BenchmarkState {
-        NerfDatasetInfo dataset_info{};
-        void* context = nullptr;
-    } state{};
+    void* context = nullptr;
 
     struct ContextGuard {
         void** context = nullptr;
@@ -163,7 +157,7 @@ int main(int argc, char** argv) {
             (void) nerf_destroy_context(*context);
             *context = nullptr;
         }
-    } destroy_context_scope{.context = &state.context};
+    } destroy_context_scope{.context = &context};
 
     constexpr NerfCreateDesc create_desc{
         .occupancy_grid_res    = 128u,
@@ -195,7 +189,7 @@ int main(int argc, char** argv) {
     };
 
     try {
-        NerfStatus status = nerf_create_context(&create_desc, &state.context);
+        NerfStatus status = nerf_create_context(&create_desc, &context);
         if (status != NERF_STATUS_OK) throw std::runtime_error("nerf_create_context failed: status=" + std::to_string(status));
 
         const std::string dataset_path_utf8 = config.dataset_path.string();
@@ -206,25 +200,25 @@ int main(int argc, char** argv) {
             .source_system = blender_scene,
             .target_system = engine,
         };
-        status = nerf_load_dataset(state.context, &load_desc, &state.dataset_info);
+        status = nerf_load_dataset(context, &load_desc, nullptr);
         if (status != NERF_STATUS_OK) throw std::runtime_error("nerf_load_dataset failed: status=" + std::to_string(status));
 
         if (!config.load_weights_path.empty()) {
             const std::string load_path_utf8 = config.load_weights_path.string();
             const NerfCheckpointFileDesc checkpoint_desc{.path_utf8 = load_path_utf8.c_str()};
-            status = nerf_load_network_weights(state.context, &checkpoint_desc);
+            status = nerf_load_network_weights(context, &checkpoint_desc);
             if (status != NERF_STATUS_OK) throw std::runtime_error("nerf_load_network_weights failed: status=" + std::to_string(status));
         }
 
         const NerfTrainingConfig training_config{
-            .aabb_min                 = config.aabb_min,
-            .aabb_max                 = config.aabb_max,
+            .aabb_min                 = NerfVec3{0.0f, 0.0f, 0.0f},
+            .aabb_max                 = NerfVec3{1.0f, 1.0f, 1.0f},
             .hyper_params             = train_hp,
             .occupancy_params         = occupancy_hp,
             .rays_per_batch           = config.rays_per_batch,
             .max_sample_steps_per_ray = config.max_sample_steps_per_ray,
         };
-        status = nerf_configure_training(state.context, &training_config);
+        status = nerf_configure_training(context, &training_config);
         if (status != NERF_STATUS_OK) throw std::runtime_error("nerf_configure_training failed: status=" + std::to_string(status));
 
         const auto t0  = std::chrono::steady_clock::now();
@@ -240,13 +234,13 @@ int main(int argc, char** argv) {
         };
 
         for (std::uint32_t step = 0u; step < config.steps; ++step) {
-            status = nerf_train_step(state.context);
+            status = nerf_train_step(context);
             if (status != NERF_STATUS_OK) throw std::runtime_error("nerf_train_step failed: status=" + std::to_string(status));
 
             StepState step_state{};
             NerfTrainStats train_stats{};
             if ((step + 1u) % config.log_interval == 0u || (step + 1u) == config.steps) {
-                status = nerf_read_train_stats(state.context, &train_stats);
+                status = nerf_read_train_stats(context, &train_stats);
                 if (status != NERF_STATUS_OK) throw std::runtime_error("nerf_read_train_stats failed: status=" + std::to_string(status));
                 step_state.loss          = train_stats.loss;
                 step_state.grad_norm     = train_stats.grad_norm;
@@ -263,7 +257,7 @@ int main(int argc, char** argv) {
         if (!config.save_weights_path.empty()) {
             const std::string save_path_utf8 = config.save_weights_path.string();
             const NerfCheckpointFileDesc checkpoint_desc{.path_utf8 = save_path_utf8.c_str()};
-            status = nerf_save_network_weights(state.context, &checkpoint_desc);
+            status = nerf_save_network_weights(context, &checkpoint_desc);
             if (status != NERF_STATUS_OK) throw std::runtime_error("nerf_save_network_weights failed: status=" + std::to_string(status));
         }
     } catch (const std::exception& e) {
