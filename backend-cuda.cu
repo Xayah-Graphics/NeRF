@@ -2019,7 +2019,6 @@ namespace nerf::runtime {
     struct DeviceContext {
         std::mutex train_runtime_mutex{};
         std::shared_ptr<TrainRuntime> train_runtime{};
-        bool dataset_loaded = false;
     };
 
 
@@ -2367,77 +2366,6 @@ namespace nerf::runtime {
         }
     }
 
-    static std::shared_ptr<TrainRuntime> runtime_for_context(DeviceContext* device_context) {
-        std::scoped_lock lock(device_context->train_runtime_mutex);
-        if (device_context->train_runtime) return device_context->train_runtime;
-
-        const auto runtime = std::make_shared<TrainRuntime>();
-        if (!init_runtime(*runtime)) return nullptr;
-
-        device_context->train_runtime = runtime;
-        return device_context->train_runtime;
-    }
-
-    static bool destroy_runtime_for_context(DeviceContext* device_context) {
-        std::shared_ptr<TrainRuntime> runtime;
-        {
-            std::scoped_lock lock(device_context->train_runtime_mutex);
-            if (!device_context->train_runtime) return true;
-            runtime = std::move(device_context->train_runtime);
-        }
-
-        std::scoped_lock run_lock(runtime->run_mutex);
-        destroy_runtime(*runtime);
-        return true;
-    }
-
-    static bool runtime_zero_network_gradients(TrainRuntime& runtime) {
-        if (cudaMemsetAsync(runtime.network.density.gradients.ptr, 0, runtime.network.density.gradients.bytes, runtime.stream) != cudaSuccess) return false;
-        if (cudaMemsetAsync(runtime.network.color.gradients.ptr, 0, runtime.network.color.gradients.bytes, runtime.stream) != cudaSuccess) return false;
-        return true;
-    }
-
-    static bool runtime_zero_scalar_buffers(TrainRuntime& runtime) {
-        if (cudaMemsetAsync(runtime.workspace.loss_sum, 0, sizeof(float), runtime.stream) != cudaSuccess) return false;
-        if (cudaMemsetAsync(runtime.workspace.grad_sumsq, 0, sizeof(float), runtime.stream) != cudaSuccess) return false;
-        if (cudaMemsetAsync(runtime.workspace.nonfinite_flag, 0, sizeof(std::uint32_t), runtime.stream) != cudaSuccess) return false;
-        return true;
-    }
-
-    static void runtime_accumulate_grad_stats(TrainRuntime& runtime) {
-        constexpr std::uint32_t threads = kThreads256;
-        const std::uint32_t density_n   = static_cast<std::uint32_t>(runtime.network.density.gradients.count);
-        const std::uint32_t color_n     = static_cast<std::uint32_t>(runtime.network.color.gradients.count);
-
-        if (density_n != 0u) {
-            k_accum_grad_stats_half<<<(density_n + threads - 1u) / threads, threads, 0, runtime.stream>>>(runtime.network.density.gradients.ptr, density_n, runtime.workspace.grad_sumsq, runtime.workspace.nonfinite_flag);
-        }
-        if (color_n != 0u) {
-            k_accum_grad_stats_half<<<(color_n + threads - 1u) / threads, threads, 0, runtime.stream>>>(runtime.network.color.gradients.ptr, color_n, runtime.workspace.grad_sumsq, runtime.workspace.nonfinite_flag);
-        }
-    }
-
-    static bool runtime_apply_optimizer(TrainRuntime& runtime, const TrainStepConfig& config) {
-        const float beta1   = config.adam_beta1;
-        const float beta2   = config.adam_beta2;
-        const float epsilon = config.adam_eps;
-
-        if (!(beta1 >= 0.0f && beta1 < 1.0f && beta2 >= 0.0f && beta2 < 1.0f && epsilon > 0.0f && std::isfinite(epsilon))) return false;
-
-        constexpr std::uint32_t threads = kThreads256;
-        constexpr float inv_loss_scale  = kInvLossScale;
-        const std::uint32_t density_n   = static_cast<std::uint32_t>(runtime.network.density.gradients.count);
-        const std::uint32_t color_n     = static_cast<std::uint32_t>(runtime.network.color.gradients.count);
-        if (density_n != 0u) {
-            k_adam_step_half<<<(density_n + threads - 1u) / threads, threads, 0, runtime.stream>>>(runtime.network.density.params_f32.ptr, runtime.network.density.params.ptr, runtime.network.density.gradients.ptr, runtime.network.density.adam_m.ptr, runtime.network.density.adam_v.ptr, density_n, config.learning_rate, beta1, beta2, epsilon, config.lr_decay_ksteps, inv_loss_scale, runtime.device_state);
-        }
-        if (color_n != 0u) {
-            k_adam_step_half<<<(color_n + threads - 1u) / threads, threads, 0, runtime.stream>>>(runtime.network.color.params_f32.ptr, runtime.network.color.params.ptr, runtime.network.color.gradients.ptr, runtime.network.color.adam_m.ptr, runtime.network.color.adam_v.ptr, color_n, config.learning_rate, beta1, beta2, epsilon, config.lr_decay_ksteps, inv_loss_scale, runtime.device_state);
-        }
-        if (cudaGetLastError() != cudaSuccess) return false;
-        return true;
-    }
-
     __global__ void k_prepare_update_density_grid(float* data, const std::uint32_t count, const float decay, const std::uint32_t update_interval, const std::uint32_t warmup_steps, const TrainingDeviceState* state) {
         const std::uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
         if (idx >= count) return;
@@ -2674,10 +2602,16 @@ NerfStatus nerf_create_context(const NerfCreateDesc* desc, void** out_context) {
         context->sample_batch_state.size_bytes = sample_batch_state.size_bytes;
     }
 
-    if (!nerf::runtime::runtime_for_context(context->cuda_context)) {
-        if (context->scratch_device_base) cudaFree(context->scratch_device_base);
-        delete context->cuda_context;
-        return NERF_STATUS_INTERNAL_ERROR;
+    {
+        auto runtime = std::make_shared<nerf::runtime::TrainRuntime>();
+        if (!nerf::runtime::init_runtime(*runtime)) {
+            nerf::runtime::destroy_runtime(*runtime);
+            if (context->scratch_device_base) cudaFree(context->scratch_device_base);
+            delete context->cuda_context;
+            return NERF_STATUS_INTERNAL_ERROR;
+        }
+        std::scoped_lock lock(context->cuda_context->train_runtime_mutex);
+        context->cuda_context->train_runtime = std::move(runtime);
     }
 
     *out_context = context.release();
@@ -2691,7 +2625,15 @@ NerfStatus nerf_destroy_context(void* context) {
     NerfStatus status = NERF_STATUS_OK;
 
     if (owned->cuda_context) {
-        if (!nerf::runtime::destroy_runtime_for_context(owned->cuda_context)) status = NERF_STATUS_INTERNAL_ERROR;
+        std::shared_ptr<nerf::runtime::TrainRuntime> runtime;
+        {
+            std::scoped_lock lock(owned->cuda_context->train_runtime_mutex);
+            runtime = std::move(owned->cuda_context->train_runtime);
+        }
+        if (runtime) {
+            std::scoped_lock run_lock(runtime->run_mutex);
+            nerf::runtime::destroy_runtime(*runtime);
+        }
         delete owned->cuda_context;
         owned->cuda_context = nullptr;
     }
@@ -2714,15 +2656,12 @@ NerfStatus nerf_load_dataset(void* context, const NerfDatasetLoadDesc* desc, Ner
     if (load_status != NERF_STATUS_OK) return load_status;
 
     ContextStorage* ctx = static_cast<ContextStorage*>(context);
-    std::shared_ptr<nerf::runtime::TrainRuntime> detached_runtime;
+    std::shared_ptr<nerf::runtime::TrainRuntime> runtime;
     {
         std::scoped_lock lock(ctx->cuda_context->train_runtime_mutex);
-        ctx->cuda_context->dataset_loaded = false;
-        detached_runtime                  = std::move(ctx->cuda_context->train_runtime);
-    }
-    if (detached_runtime) {
-        std::scoped_lock run_lock(detached_runtime->run_mutex);
-        nerf::runtime::destroy_runtime(*detached_runtime);
+        runtime                      = ctx->cuda_context->train_runtime;
+        runtime->training_configured = false;
+        runtime->host_frame_index    = 0u;
     }
 
     if (ctx->scene_device_base) {
@@ -2782,10 +2721,6 @@ NerfStatus nerf_load_dataset(void* context, const NerfDatasetLoadDesc* desc, Ner
     }
 
     ctx->dataset_info = host_data.info;
-    {
-        std::scoped_lock lock(ctx->cuda_context->train_runtime_mutex);
-        ctx->cuda_context->dataset_loaded = true;
-    }
 
     if (out_info) *out_info = ctx->dataset_info;
     return NERF_STATUS_OK;
@@ -2806,15 +2741,12 @@ NerfStatus nerf_configure_training(void* context, const NerfTrainingConfig* conf
     std::shared_ptr<nerf::runtime::TrainRuntime> runtime;
     {
         std::scoped_lock lock(ctx->cuda_context->train_runtime_mutex);
-        if (!ctx->cuda_context->dataset_loaded) return NERF_STATUS_DATASET_NOT_LOADED;
+        if (!ctx->scene_device_base) return NERF_STATUS_DATASET_NOT_LOADED;
         runtime = ctx->cuda_context->train_runtime;
     }
     if (normalized.rays_per_batch > ctx->max_batch_rays) return NERF_STATUS_RANGE_ERROR;
     const std::uint64_t total_sample_steps = static_cast<std::uint64_t>(normalized.rays_per_batch) * static_cast<std::uint64_t>(normalized.max_sample_steps_per_ray);
     if (total_sample_steps > static_cast<std::uint64_t>(ctx->max_sample_steps)) return NERF_STATUS_RANGE_ERROR;
-
-    if (!runtime) runtime = nerf::runtime::runtime_for_context(ctx->cuda_context);
-    if (!runtime) return NERF_STATUS_INTERNAL_ERROR;
 
     const std::uint32_t occupancy_cell_count = static_cast<std::uint32_t>(static_cast<std::uint64_t>(ctx->occupancy_grid_res) * static_cast<std::uint64_t>(ctx->occupancy_grid_res) * static_cast<std::uint64_t>(ctx->occupancy_grid_res));
     const nerf::runtime::OccupancyUpdateRequest occupancy_request{
@@ -2894,12 +2826,11 @@ NerfStatus nerf_train_step(void* context) {
     std::shared_ptr<nerf::runtime::TrainRuntime> runtime;
     {
         std::scoped_lock lock(ctx->cuda_context->train_runtime_mutex);
-        if (!ctx->cuda_context->dataset_loaded) return NERF_STATUS_DATASET_NOT_LOADED;
+        if (!ctx->scene_device_base) return NERF_STATUS_DATASET_NOT_LOADED;
         runtime = ctx->cuda_context->train_runtime;
     }
     if (!runtime || !runtime->training_configured) return NERF_STATUS_TRAINING_NOT_CONFIGURED;
     std::scoped_lock run_lock(runtime->run_mutex);
-    if (!runtime->training_configured) return NERF_STATUS_TRAINING_NOT_CONFIGURED;
 
     const std::uint32_t frame_index  = runtime->host_frame_index;
     const std::uint32_t camera_count = runtime->training_request.camera_count;
@@ -2941,8 +2872,11 @@ NerfStatus nerf_train_step(void* context) {
     if (cudaMemcpyAsync(&host_batch_state, sampler_request.batch_state, sizeof(nerf::sampler::SampleBatchState), cudaMemcpyDeviceToHost, runtime->stream) != cudaSuccess) return NERF_STATUS_INTERNAL_ERROR;
     if (cudaStreamSynchronize(runtime->stream) != cudaSuccess) return NERF_STATUS_INTERNAL_ERROR;
 
-    if (!nerf::runtime::runtime_zero_network_gradients(*runtime)) return NERF_STATUS_INTERNAL_ERROR;
-    if (!nerf::runtime::runtime_zero_scalar_buffers(*runtime)) return NERF_STATUS_INTERNAL_ERROR;
+    if (cudaMemsetAsync(runtime->network.density.gradients.ptr, 0, runtime->network.density.gradients.bytes, runtime->stream) != cudaSuccess) return NERF_STATUS_INTERNAL_ERROR;
+    if (cudaMemsetAsync(runtime->network.color.gradients.ptr, 0, runtime->network.color.gradients.bytes, runtime->stream) != cudaSuccess) return NERF_STATUS_INTERNAL_ERROR;
+    if (cudaMemsetAsync(runtime->workspace.loss_sum, 0, sizeof(float), runtime->stream) != cudaSuccess) return NERF_STATUS_INTERNAL_ERROR;
+    if (cudaMemsetAsync(runtime->workspace.grad_sumsq, 0, sizeof(float), runtime->stream) != cudaSuccess) return NERF_STATUS_INTERNAL_ERROR;
+    if (cudaMemsetAsync(runtime->workspace.nonfinite_flag, 0, sizeof(std::uint32_t), runtime->stream) != cudaSuccess) return NERF_STATUS_INTERNAL_ERROR;
     if (host_batch_state.overflow == 0u) {
         nerf::network::NetworkTrainingRequest training_request{};
         training_request.sample_rays  = runtime->training_request.sample_rays;
@@ -2953,13 +2887,39 @@ NerfStatus nerf_train_step(void* context) {
         if (training_request.ray_count != 0u && training_request.sample_count != 0u) {
             if (!nerf::network::run_network_training(runtime->network, runtime->workspace, runtime->stream, training_request)) return NERF_STATUS_INTERNAL_ERROR;
         }
-        nerf::runtime::runtime_accumulate_grad_stats(*runtime);
+        constexpr std::uint32_t threads = kThreads256;
+        const std::uint32_t density_n   = static_cast<std::uint32_t>(runtime->network.density.gradients.count);
+        const std::uint32_t color_n     = static_cast<std::uint32_t>(runtime->network.color.gradients.count);
+        if (density_n != 0u) {
+            nerf::runtime::k_accum_grad_stats_half<<<(density_n + threads - 1u) / threads, threads, 0, runtime->stream>>>(runtime->network.density.gradients.ptr, density_n, runtime->workspace.grad_sumsq, runtime->workspace.nonfinite_flag);
+        }
+        if (color_n != 0u) {
+            nerf::runtime::k_accum_grad_stats_half<<<(color_n + threads - 1u) / threads, threads, 0, runtime->stream>>>(runtime->network.color.gradients.ptr, color_n, runtime->workspace.grad_sumsq, runtime->workspace.nonfinite_flag);
+        }
         if (cudaGetLastError() != cudaSuccess) return NERF_STATUS_INTERNAL_ERROR;
     }
 
     nerf::runtime::k_finalize_training_stats<<<1, 1, 0, runtime->stream>>>(runtime->device_state, runtime->training_request.batch_state, runtime->workspace.loss_sum, runtime->workspace.grad_sumsq, runtime->workspace.nonfinite_flag);
     if (cudaGetLastError() != cudaSuccess) return NERF_STATUS_INTERNAL_ERROR;
-    if (!nerf::runtime::runtime_apply_optimizer(*runtime, runtime->training_request.train_cfg)) return NERF_STATUS_INTERNAL_ERROR;
+    {
+        const float beta1   = runtime->training_request.train_cfg.adam_beta1;
+        const float beta2   = runtime->training_request.train_cfg.adam_beta2;
+        const float epsilon = runtime->training_request.train_cfg.adam_eps;
+        if (!(beta1 >= 0.0f && beta1 < 1.0f && beta2 >= 0.0f && beta2 < 1.0f && epsilon > 0.0f && std::isfinite(epsilon))) return NERF_STATUS_INTERNAL_ERROR;
+
+        constexpr std::uint32_t threads = kThreads256;
+        constexpr float inv_loss_scale  = kInvLossScale;
+        const std::uint32_t density_n   = static_cast<std::uint32_t>(runtime->network.density.gradients.count);
+        const std::uint32_t color_n     = static_cast<std::uint32_t>(runtime->network.color.gradients.count);
+        if (density_n != 0u) {
+            nerf::runtime::k_adam_step_half<<<(density_n + threads - 1u) / threads, threads, 0, runtime->stream>>>(
+                runtime->network.density.params_f32.ptr, runtime->network.density.params.ptr, runtime->network.density.gradients.ptr, runtime->network.density.adam_m.ptr, runtime->network.density.adam_v.ptr, density_n, runtime->training_request.train_cfg.learning_rate, beta1, beta2, epsilon, runtime->training_request.train_cfg.lr_decay_ksteps, inv_loss_scale, runtime->device_state);
+        }
+        if (color_n != 0u) {
+            nerf::runtime::k_adam_step_half<<<(color_n + threads - 1u) / threads, threads, 0, runtime->stream>>>(runtime->network.color.params_f32.ptr, runtime->network.color.params.ptr, runtime->network.color.gradients.ptr, runtime->network.color.adam_m.ptr, runtime->network.color.adam_v.ptr, color_n, runtime->training_request.train_cfg.learning_rate, beta1, beta2, epsilon, runtime->training_request.train_cfg.lr_decay_ksteps, inv_loss_scale, runtime->device_state);
+        }
+        if (cudaGetLastError() != cudaSuccess) return NERF_STATUS_INTERNAL_ERROR;
+    }
     nerf::runtime::k_commit_training_step<<<1, 1, 0, runtime->stream>>>(runtime->device_state);
     if (cudaGetLastError() != cudaSuccess) return NERF_STATUS_INTERNAL_ERROR;
 
@@ -2988,8 +2948,11 @@ NerfStatus nerf_save_network_weights(void* context, const NerfCheckpointFileDesc
     if (!context || !desc || !desc->path_utf8) return NERF_STATUS_INVALID_ARGUMENT;
 
     const ContextStorage* ctx = static_cast<ContextStorage*>(context);
-    const auto runtime        = nerf::runtime::runtime_for_context(ctx->cuda_context);
-    if (!runtime) return NERF_STATUS_INTERNAL_ERROR;
+    std::shared_ptr<nerf::runtime::TrainRuntime> runtime;
+    {
+        std::scoped_lock lock(ctx->cuda_context->train_runtime_mutex);
+        runtime = ctx->cuda_context->train_runtime;
+    }
     nerf::network::NetworkCheckpointLayout layout{};
     if (!nerf::network::describe_network_checkpoint_layout(runtime->network, layout)) return NERF_STATUS_INTERNAL_ERROR;
 
@@ -3008,8 +2971,11 @@ NerfStatus nerf_load_network_weights(void* context, const NerfCheckpointFileDesc
     if (!context || !desc || !desc->path_utf8) return NERF_STATUS_INVALID_ARGUMENT;
 
     const ContextStorage* ctx = static_cast<ContextStorage*>(context);
-    const auto runtime        = nerf::runtime::runtime_for_context(ctx->cuda_context);
-    if (!runtime) return NERF_STATUS_INTERNAL_ERROR;
+    std::shared_ptr<nerf::runtime::TrainRuntime> runtime;
+    {
+        std::scoped_lock lock(ctx->cuda_context->train_runtime_mutex);
+        runtime = ctx->cuda_context->train_runtime;
+    }
     nerf::network::NetworkCheckpointLayout layout{};
     if (!nerf::network::describe_network_checkpoint_layout(runtime->network, layout)) return NERF_STATUS_INTERNAL_ERROR;
 
