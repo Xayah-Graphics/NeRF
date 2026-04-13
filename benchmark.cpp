@@ -3,14 +3,20 @@
 #define STB_IMAGE_IMPLEMENTATION
 #include "stb/stb_image.h"
 
+#define STB_IMAGE_WRITE_IMPLEMENTATION
+#include "stb/stb_image_write.h"
+
 #include "json/json.hpp"
 
 import std;
 
-constexpr std::uint32_t kDefaultSteps          = 10000u;
-constexpr std::uint32_t kDefaultRays           = 4096u;
-constexpr std::uint32_t kDefaultMaxSampleSteps = 64u;
-constexpr std::uint32_t kDefaultLogInterval    = 200u;
+constexpr std::uint32_t kDefaultSteps             = 10000u;
+constexpr std::uint32_t kDefaultRays              = 4096u;
+constexpr std::uint32_t kDefaultMaxSampleSteps    = 64u;
+constexpr std::uint32_t kDefaultLogInterval       = 200u;
+constexpr std::uint32_t kDefaultInferenceInterval = 2000u;
+constexpr std::uint32_t kDefaultInferenceCamera   = 0u;
+constexpr std::uint32_t kDefaultInferenceSamples  = 64u;
 
 struct HostDatasetData {
     std::vector<std::uint8_t> images_rgba8;
@@ -55,6 +61,58 @@ static bool safe_mul_u64(const std::uint64_t a, const std::uint64_t b, std::uint
     if (a != 0u && b > std::numeric_limits<std::uint64_t>::max() / a) return false;
     *out = a * b;
     return true;
+}
+
+struct InferenceMetrics {
+    double psnr      = 0.0;
+    double pred_luma = 0.0;
+};
+
+static InferenceMetrics evaluate_inference_rgba8(const HostDatasetData& dataset, const std::uint32_t camera_idx, const std::span<const std::uint8_t> pred_rgba8) {
+    const std::uint32_t image_width  = dataset.info.image_width;
+    const std::uint32_t image_height = dataset.info.image_height;
+    const std::size_t image_stride   = static_cast<std::size_t>(image_width) * static_cast<std::size_t>(image_height) * 4u;
+    const std::size_t camera_base    = static_cast<std::size_t>(camera_idx) * image_stride;
+    constexpr float inv255           = 1.0f / 255.0f;
+    double mse                       = 0.0;
+    double luma_sum                  = 0.0;
+
+    for (std::uint32_t y = 0u; y < image_height; ++y) {
+        for (std::uint32_t x = 0u; x < image_width; ++x) {
+            const std::size_t gt_base = camera_base + (static_cast<std::size_t>(y) * image_width + x) * 4u;
+            const float ga            = static_cast<float>(dataset.images_rgba8[gt_base + 3u]) * inv255;
+            const float gr0           = static_cast<float>(dataset.images_rgba8[gt_base + 0u]) * inv255;
+            const float gg0           = static_cast<float>(dataset.images_rgba8[gt_base + 1u]) * inv255;
+            const float gb0           = static_cast<float>(dataset.images_rgba8[gt_base + 2u]) * inv255;
+
+            const std::size_t pred_base = (static_cast<std::size_t>(y) * image_width + x) * 4u;
+            const float pr              = static_cast<float>(pred_rgba8[pred_base + 0u]) * inv255;
+            const float pg              = static_cast<float>(pred_rgba8[pred_base + 1u]) * inv255;
+            const float pb              = static_cast<float>(pred_rgba8[pred_base + 2u]) * inv255;
+
+            const float gt_r = gr0 * ga + (1.0f - ga);
+            const float gt_g = gg0 * ga + (1.0f - ga);
+            const float gt_b = gb0 * ga + (1.0f - ga);
+
+            const double dr = pr - gt_r;
+            const double dg = pg - gt_g;
+            const double db = pb - gt_b;
+            mse += (dr * dr + dg * dg + db * db) / 3.0;
+            luma_sum += static_cast<double>(0.2126f * pr + 0.7152f * pg + 0.0722f * pb);
+        }
+    }
+
+    mse /= static_cast<double>(image_width) * static_cast<double>(image_height);
+    return InferenceMetrics{
+        .psnr      = mse > 0.0 ? -10.0 * std::log10(mse) : std::numeric_limits<double>::infinity(),
+        .pred_luma = luma_sum / (static_cast<double>(image_width) * static_cast<double>(image_height)),
+    };
+}
+
+static bool write_rgba_png(const std::filesystem::path& path, const std::uint32_t width, const std::uint32_t height, const std::span<const std::uint8_t> rgba8) {
+    std::error_code ec{};
+    if (path.has_parent_path()) std::filesystem::create_directories(path.parent_path(), ec);
+    return stbi_write_png(path.string().c_str(), static_cast<int>(width), static_cast<int>(height), 4, rgba8.data(), static_cast<int>(width) * 4) != 0;
 }
 
 static NerfStatus resolve_dataset_json_path(const char* path_utf8, std::filesystem::path& out_json_path) {
@@ -331,10 +389,14 @@ int main(int argc, char** argv) {
     std::filesystem::path dataset_path{};
     std::filesystem::path load_weights_path{};
     std::filesystem::path save_weights_path{};
-    std::uint32_t steps            = kDefaultSteps;
-    std::uint32_t rays_per_batch   = kDefaultRays;
-    std::uint32_t max_sample_steps = kDefaultMaxSampleSteps;
-    std::uint32_t log_interval     = kDefaultLogInterval;
+    std::filesystem::path inference_out_path{"nerf_inference_final.png"};
+    std::uint32_t steps              = kDefaultSteps;
+    std::uint32_t rays_per_batch     = kDefaultRays;
+    std::uint32_t max_sample_steps   = kDefaultMaxSampleSteps;
+    std::uint32_t log_interval       = kDefaultLogInterval;
+    std::uint32_t inference_interval = kDefaultInferenceInterval;
+    std::uint32_t inference_camera   = kDefaultInferenceCamera;
+    std::uint32_t inference_samples  = kDefaultInferenceSamples;
 
     auto print_help = [&]() {
         const std::string exe_name = (argc > 0 && argv[0]) ? std::filesystem::path(argv[0]).filename().string() : std::string{"benchmark"};
@@ -343,6 +405,10 @@ int main(int argc, char** argv) {
         std::cout << "  --rays <N> default " << rays_per_batch << '\n';
         std::cout << "  --max-sample-steps <N> default " << max_sample_steps << '\n';
         std::cout << "  --log-interval <N> default " << log_interval << '\n';
+        std::cout << "  --inference-interval <N> default " << inference_interval << '\n';
+        std::cout << "  --inference-camera <N> default " << inference_camera << '\n';
+        std::cout << "  --inference-samples <N> default " << inference_samples << '\n';
+        std::cout << "  --inference-out <path> default " << inference_out_path.string() << '\n';
         std::cout << "  --load-weights <path> optional\n";
         std::cout << "  --save-weights <path> optional\n";
     };
@@ -385,6 +451,23 @@ int main(int argc, char** argv) {
                 std::cerr << "invalid value for --log-interval: " << value << '\n';
                 return 2;
             }
+        } else if (key == "--inference-interval") {
+            if (!parse_u32(value, inference_interval)) {
+                std::cerr << "invalid value for --inference-interval: " << value << '\n';
+                return 2;
+            }
+        } else if (key == "--inference-camera") {
+            if (!parse_u32(value, inference_camera)) {
+                std::cerr << "invalid value for --inference-camera: " << value << '\n';
+                return 2;
+            }
+        } else if (key == "--inference-samples") {
+            if (!parse_u32(value, inference_samples)) {
+                std::cerr << "invalid value for --inference-samples: " << value << '\n';
+                return 2;
+            }
+        } else if (key == "--inference-out") {
+            inference_out_path = value;
         } else {
             std::cerr << "unknown argument: " << key << '\n';
             return 2;
@@ -395,8 +478,8 @@ int main(int argc, char** argv) {
         std::cerr << "--dataset is required\n";
         return 2;
     }
-    if (steps == 0u || rays_per_batch == 0u || max_sample_steps == 0u || log_interval == 0u) {
-        std::cerr << "steps/rays/max-sample-steps/log-interval must be > 0\n";
+    if (steps == 0u || rays_per_batch == 0u || max_sample_steps == 0u || log_interval == 0u || inference_interval == 0u || inference_samples == 0u) {
+        std::cerr << "steps/rays/max-sample-steps/log-interval/inference-interval/inference-samples must be > 0\n";
         return 2;
     }
 
@@ -430,6 +513,12 @@ int main(int argc, char** argv) {
         const std::string dataset_path_utf8 = dataset_path.string();
         NerfStatus status                   = load_nerf_synthetic_host_dataset(dataset_path_utf8.c_str(), host_data);
         if (status != NERF_STATUS_OK) throw std::runtime_error("load_nerf_synthetic_host_dataset failed: status=" + std::to_string(status));
+        if (inference_camera >= host_data.info.image_count) throw std::runtime_error("inference camera is out of range");
+
+        std::uint64_t inference_bytes = host_data.info.image_width;
+        if (!safe_mul_u64(inference_bytes, host_data.info.image_height, &inference_bytes)) throw std::runtime_error("inference image size overflow");
+        if (!safe_mul_u64(inference_bytes, 4u, &inference_bytes)) throw std::runtime_error("inference image size overflow");
+        std::vector<std::uint8_t> inference_rgba8(inference_bytes);
 
         NerfCreateDesc create_desc{
             .occupancy_grid_res    = 128u,
@@ -437,9 +526,9 @@ int main(int argc, char** argv) {
             .max_batch_rays        = 1u << 16,
             .arena_alignment_bytes = 256u,
             .images_rgba8          = host_data.images_rgba8.data(),
-            .images_bytes          = static_cast<std::uint64_t>(host_data.images_rgba8.size()),
+            .images_bytes          = (host_data.images_rgba8.size()),
             .cameras_4x4_packed    = host_data.cameras_4x4_packed.data(),
-            .cameras_bytes         = static_cast<std::uint64_t>(host_data.cameras_4x4_packed.size()) * sizeof(float),
+            .cameras_bytes         = host_data.cameras_4x4_packed.size() * sizeof(float),
             .image_count           = host_data.info.image_count,
             .image_width           = host_data.info.image_width,
             .image_height          = host_data.info.image_height,
@@ -492,6 +581,27 @@ int main(int argc, char** argv) {
                 const float steps_per_sec = sec > 0.0f ? static_cast<float>(step + 1u) / sec : 0.0f;
                 const double eta_sec      = steps_per_sec > 0.0f ? static_cast<double>(steps - (step + 1u)) / static_cast<double>(steps_per_sec) : std::numeric_limits<double>::infinity();
                 std::cout << "[train] step=" << (step + 1u) << " loss=" << loss << " loss_ema=" << loss_ema << " grad_norm=" << grad_norm << " sps=" << steps_per_sec << " eta_sec=" << eta_sec << " nonfinite=" << (has_nonfinite ? 1 : 0) << '\n';
+            }
+
+            if ((step + 1u) % inference_interval == 0u || (step + 1u) == steps) {
+                NerfInferenceInfo inference_info{};
+                const NerfInferenceRequest inference_request{
+                    .camera_idx      = inference_camera,
+                    .samples_per_ray = inference_samples,
+                    .memory_kind     = NERF_MEMORY_HOST,
+                    .dst_rgba8       = inference_rgba8.data(),
+                    .dst_bytes       = (inference_rgba8.size()),
+                };
+                status = nerf_inference(context, &inference_request, &inference_info);
+                if (status != NERF_STATUS_OK) throw std::runtime_error("nerf_inference failed: status=" + std::to_string(status));
+
+                const InferenceMetrics metrics = evaluate_inference_rgba8(host_data, inference_camera, inference_rgba8);
+                std::cout << "[eval] step=" << (step + 1u) << " camera=" << inference_camera << " psnr=" << metrics.psnr << " pred_luma=" << metrics.pred_luma << '\n';
+
+                if ((step + 1u) == steps) {
+                    if (!write_rgba_png(inference_out_path, inference_info.width, inference_info.height, inference_rgba8)) throw std::runtime_error("stbi_write_png failed");
+                    std::cout << "[eval] saved=" << inference_out_path.string() << '\n';
+                }
             }
         }
 

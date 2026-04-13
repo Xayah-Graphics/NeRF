@@ -90,6 +90,24 @@ typedef struct NerfTrainStats {
 } NerfTrainStats;
 NERF_API NerfStatus nerf_read_train_stats(void* context, NerfTrainStats* out_stats);
 
+typedef enum NerfMemoryKind { NERF_MEMORY_HOST = 1, NERF_MEMORY_CUDA_DEVICE = 2 } NerfMemoryKind;
+typedef struct NerfInferenceRequest {
+    uint32_t camera_idx;
+    uint32_t samples_per_ray;
+    uint32_t memory_kind;
+    void* dst_rgba8;
+    uint64_t dst_bytes;
+} NerfInferenceRequest;
+typedef struct NerfInferenceInfo {
+    uint64_t capacity_bytes;
+    uint64_t valid_bytes;
+    uint32_t row_stride_bytes;
+    uint32_t width;
+    uint32_t height;
+    uint32_t generation;
+} NerfInferenceInfo;
+NERF_API NerfStatus nerf_inference(void* context, const NerfInferenceRequest* request, NerfInferenceInfo* out_info);
+
 typedef struct NerfCheckpointFileDesc {
     const char* path_utf8;
 } NerfCheckpointFileDesc;

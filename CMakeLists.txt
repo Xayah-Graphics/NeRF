@@ -84,6 +84,10 @@ if (NERF_BUILD_BENCHMARK)
             "https://raw.githubusercontent.com/nothings/stb/28d546d5eb77d4585506a20480f4de2e706dff4c/stb_image.h"
             "${CMAKE_CURRENT_BINARY_DIR}/vendor/stb/stb_image.h"
     )
+    download_if_needed(
+            "https://raw.githubusercontent.com/nothings/stb/28d546d5eb77d4585506a20480f4de2e706dff4c/stb_image_write.h"
+            "${CMAKE_CURRENT_BINARY_DIR}/vendor/stb/stb_image_write.h"
+    )
     add_executable(benchmark benchmark.cpp)
     target_link_libraries(benchmark PRIVATE nerf)
     target_include_directories(benchmark PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/vendor")
