@@ -883,12 +883,56 @@ namespace nerf::encoder {
             }
         }
 
+        __global__ void k_encode_positions_only(const float* __restrict__ inputs, const std::uint32_t rows, float* __restrict__ enc_pts) {
+            const std::uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+            if (idx >= rows) return;
+
+            const std::uint32_t in_base = idx * 7u;
+            const float px              = inputs[in_base + 0u];
+            const float py              = inputs[in_base + 1u];
+            const float pz              = inputs[in_base + 2u];
+
+            float* out_p = enc_pts + static_cast<std::uint64_t>(idx) * kPtsInDim;
+
+            out_p[0] = px;
+            out_p[1] = py;
+            out_p[2] = pz;
+
+            std::uint32_t p_off = 3u;
+            float p_freq        = 1.0f;
+            for (std::uint32_t l = 0u; l < kPosFreqs; ++l) {
+                const float ax = px * p_freq;
+                const float ay = py * p_freq;
+                const float az = pz * p_freq;
+                float sx = 0.0f, cx = 0.0f;
+                float sy = 0.0f, cy = 0.0f;
+                float sz = 0.0f, cz = 0.0f;
+                __sincosf(ax, &sx, &cx);
+                __sincosf(ay, &sy, &cy);
+                __sincosf(az, &sz, &cz);
+                out_p[p_off + 0u] = sx;
+                out_p[p_off + 1u] = sy;
+                out_p[p_off + 2u] = sz;
+                out_p[p_off + 3u] = cx;
+                out_p[p_off + 4u] = cy;
+                out_p[p_off + 5u] = cz;
+                p_off += 6u;
+                p_freq *= 2.0f;
+            }
+        }
     } // namespace
 
     bool run_encoder_module(cudaStream_t stream, const float* sample_inputs, const std::uint32_t rows, float* encoded_pts, float* encoded_dir) {
         constexpr std::uint32_t threads = kThreads256;
         const std::uint32_t blocks      = (rows + threads - 1u) / threads;
         k_encode_sample_inputs<<<blocks, threads, 0, stream>>>(sample_inputs, rows, encoded_pts, encoded_dir);
+        return cudaGetLastError() == cudaSuccess;
+    }
+
+    bool run_position_encoder_module(cudaStream_t stream, const float* sample_inputs, const std::uint32_t rows, float* encoded_pts) {
+        constexpr std::uint32_t threads = kThreads256;
+        const std::uint32_t blocks      = (rows + threads - 1u) / threads;
+        k_encode_positions_only<<<blocks, threads, 0, stream>>>(sample_inputs, rows, encoded_pts);
         return cudaGetLastError() == cudaSuccess;
     }
 } // namespace nerf::encoder
@@ -1655,6 +1699,121 @@ namespace nerf::network {
             if (idx >= n) return;
             dst[idx] = __float2half_rn(__half2float(dst[idx]) + __half2float(src[idx]));
         }
+
+        __global__ void k_unpack_density_sigma(const __half* __restrict__ density_output, const std::uint32_t rows, float* __restrict__ raw_sigma) {
+            const std::uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+            if (idx >= rows) return;
+            raw_sigma[idx] = __half2float(density_output[static_cast<std::uint64_t>(idx) * kDensityOutputDim]);
+        }
+
+        __global__ void k_ray_march_mse_grad(const float* __restrict__ raw_rgb, const float* __restrict__ raw_sigma, const nerf::sampler::SampleStep* __restrict__ sample_steps, const nerf::sampler::SampleRay* __restrict__ rays, const nerf::sampler::SampleBatchState* __restrict__ batch_state, std::uint32_t ray_count, float* __restrict__ d_raw_rgb, float* __restrict__ d_raw_sigma, float* __restrict__ trans_tmp, float* __restrict__ loss_sum) {
+            const std::uint32_t local_ray   = blockIdx.x * blockDim.x + threadIdx.x;
+            float ray_loss                  = 0.0f;
+            const std::uint32_t active_rays = batch_state->active_ray_count;
+            const float inv_norm            = active_rays == 0u ? 0.0f : 1.0f / static_cast<float>(active_rays);
+            if (local_ray < ray_count) {
+                const nerf::sampler::SampleRay ray = rays[local_ray];
+                const std::uint32_t count          = ray.sample_count;
+                if (count > 0u) {
+                    const std::uint32_t base = ray.sample_begin;
+
+                    float T       = 1.0f;
+                    float accum_r = 0.0f;
+                    float accum_g = 0.0f;
+                    float accum_b = 0.0f;
+
+                    for (std::uint32_t i = 0; i < count; ++i) {
+                        const std::uint32_t s = base + i;
+                        const float dt        = fmaxf(0.0f, sample_steps[s].dt);
+
+                        const float sig_raw = raw_sigma[s];
+                        const float sigma   = softplus_sigma(sig_raw);
+                        const float a       = 1.0f - __expf(-(sigma * dt));
+
+                        const float r = sigmoid_raw(raw_rgb[static_cast<std::uint64_t>(s) * 3ull + 0ull]);
+                        const float g = sigmoid_raw(raw_rgb[static_cast<std::uint64_t>(s) * 3ull + 1ull]);
+                        const float b = sigmoid_raw(raw_rgb[static_cast<std::uint64_t>(s) * 3ull + 2ull]);
+
+                        trans_tmp[s]  = T;
+                        const float w = T * a;
+
+                        accum_r += w * r;
+                        accum_g += w * g;
+                        accum_b += w * b;
+
+                        T *= 1.0f - a;
+                    }
+
+                    const float pred_r = accum_r + T;
+                    const float pred_g = accum_g + T;
+                    const float pred_b = accum_b + T;
+
+                    const float gt_r = ray.gt_r;
+                    const float gt_g = ray.gt_g;
+                    const float gt_b = ray.gt_b;
+                    const float gt_a = fminf(1.0f, fmaxf(0.0f, ray.gt_a));
+
+                    const float ray_w = 0.1f + 0.9f * gt_a;
+
+                    const float dr = pred_r - gt_r;
+                    const float dg = pred_g - gt_g;
+                    const float db = pred_b - gt_b;
+                    ray_loss       = ray_w * (dr * dr + dg * dg + db * db);
+
+                    const float g_r = 2.0f * ray_w * dr * inv_norm;
+                    const float g_g = 2.0f * ray_w * dg * inv_norm;
+                    const float g_b = 2.0f * ray_w * db * inv_norm;
+
+                    float suffix_r = T;
+                    float suffix_g = T;
+                    float suffix_b = T;
+
+                    for (int i = static_cast<int>(count) - 1; i >= 0; --i) {
+                        const std::uint32_t s        = base + static_cast<std::uint32_t>(i);
+                        const float dt               = fmaxf(0.0f, sample_steps[s].dt);
+                        const float sig_raw          = raw_sigma[s];
+                        const float sigma            = softplus_sigma(sig_raw);
+                        const float exp_neg_sigma_dt = __expf(-(sigma * dt));
+                        const float a                = 1.0f - exp_neg_sigma_dt;
+                        const float one_minus_a      = fmaxf(1e-6f, 1.0f - a);
+
+                        const float r       = sigmoid_raw(raw_rgb[static_cast<std::uint64_t>(s) * 3ull + 0ull]);
+                        const float g       = sigmoid_raw(raw_rgb[static_cast<std::uint64_t>(s) * 3ull + 1ull]);
+                        const float b       = sigmoid_raw(raw_rgb[static_cast<std::uint64_t>(s) * 3ull + 2ull]);
+                        const float trans_i = trans_tmp[s];
+                        const float w       = trans_i * a;
+
+                        const float dC_da_r = trans_i * r - suffix_r / one_minus_a;
+                        const float dC_da_g = trans_i * g - suffix_g / one_minus_a;
+                        const float dC_da_b = trans_i * b - suffix_b / one_minus_a;
+                        const float dL_da   = g_r * dC_da_r + g_g * dC_da_g + g_b * dC_da_b;
+
+                        const float dsigma_draw = sigmoid_raw(sig_raw);
+                        d_raw_sigma[s]          = dL_da * dt * exp_neg_sigma_dt * dsigma_draw;
+
+                        const float wr                                         = w * g_r;
+                        const float wg                                         = w * g_g;
+                        const float wb                                         = w * g_b;
+                        d_raw_rgb[static_cast<std::uint64_t>(s) * 3ull + 0ull] = wr * r * (1.0f - r);
+                        d_raw_rgb[static_cast<std::uint64_t>(s) * 3ull + 1ull] = wg * g * (1.0f - g);
+                        d_raw_rgb[static_cast<std::uint64_t>(s) * 3ull + 2ull] = wb * b * (1.0f - b);
+
+                        suffix_r += w * r;
+                        suffix_g += w * g;
+                        suffix_b += w * b;
+                    }
+                }
+            }
+
+            __shared__ float block_loss[256];
+            block_loss[threadIdx.x] = ray_loss;
+            __syncthreads();
+            for (std::uint32_t stride = blockDim.x >> 1u; stride > 0u; stride >>= 1u) {
+                if (threadIdx.x < stride) block_loss[threadIdx.x] += block_loss[threadIdx.x + stride];
+                __syncthreads();
+            }
+            if (threadIdx.x == 0u) atomicAdd(loss_sum, block_loss[0]);
+        }
     } // namespace
 
     bool init_network_module(NetworkSet& network_set, cudaStream_t stream) {
@@ -1812,113 +1971,21 @@ namespace nerf::network {
         return cudaGetLastError() == cudaSuccess;
     }
 
-    __global__ void k_ray_march_mse_grad(const float* __restrict__ raw_rgb, const float* __restrict__ raw_sigma, const nerf::sampler::SampleStep* __restrict__ sample_steps, const nerf::sampler::SampleRay* __restrict__ rays, const nerf::sampler::SampleBatchState* __restrict__ batch_state, std::uint32_t ray_count, float* __restrict__ d_raw_rgb, float* __restrict__ d_raw_sigma, float* __restrict__ trans_tmp, float* __restrict__ loss_sum) {
-        const std::uint32_t local_ray   = blockIdx.x * blockDim.x + threadIdx.x;
-        float ray_loss                  = 0.0f;
-        const std::uint32_t active_rays = batch_state->active_ray_count;
-        const float inv_norm            = active_rays == 0u ? 0.0f : 1.0f / static_cast<float>(active_rays);
-        if (local_ray < ray_count) {
-            const nerf::sampler::SampleRay ray = rays[local_ray];
-            const std::uint32_t count          = ray.sample_count;
-            if (count > 0u) {
-                const std::uint32_t base = ray.sample_begin;
+    bool run_density_inference(NetworkSet& network_set, NetworkWorkspace& workspace, cudaStream_t stream, const float* encoded_pts, const std::uint32_t rows, float* raw_sigma) {
+        const std::uint32_t padded_rows = (rows + kNetworkBatchGranularity - 1u) / kNetworkBatchGranularity * kNetworkBatchGranularity;
 
-                float T       = 1.0f;
-                float accum_r = 0.0f;
-                float accum_g = 0.0f;
-                float accum_b = 0.0f;
+        constexpr std::uint32_t threads   = kThreads256;
+        const std::uint32_t density_total = padded_rows * kDensityInputDim;
 
-                for (std::uint32_t i = 0; i < count; ++i) {
-                    const std::uint32_t s = base + i;
-                    const float dt        = fmaxf(0.0f, sample_steps[s].dt);
+        k_pack_density_input<<<(density_total + threads - 1u) / threads, threads, 0, stream>>>(encoded_pts, rows, padded_rows, workspace.density_input);
+        if (cudaGetLastError() != cudaSuccess) return false;
 
-                    const float sig_raw = raw_sigma[s];
-                    const float sigma   = softplus_sigma(sig_raw);
-                    const float a       = 1.0f - __expf(-(sigma * dt));
-
-                    const float r = sigmoid_raw(raw_rgb[static_cast<std::uint64_t>(s) * 3ull + 0ull]);
-                    const float g = sigmoid_raw(raw_rgb[static_cast<std::uint64_t>(s) * 3ull + 1ull]);
-                    const float b = sigmoid_raw(raw_rgb[static_cast<std::uint64_t>(s) * 3ull + 2ull]);
-
-                    trans_tmp[s]  = T;
-                    const float w = T * a;
-
-                    accum_r += w * r;
-                    accum_g += w * g;
-                    accum_b += w * b;
-
-                    T *= 1.0f - a;
-                }
-
-                const float pred_r = accum_r + T;
-                const float pred_g = accum_g + T;
-                const float pred_b = accum_b + T;
-
-                const float gt_r = ray.gt_r;
-                const float gt_g = ray.gt_g;
-                const float gt_b = ray.gt_b;
-                const float gt_a = fminf(1.0f, fmaxf(0.0f, ray.gt_a));
-
-                const float ray_w = 0.1f + 0.9f * gt_a;
-
-                const float dr = pred_r - gt_r;
-                const float dg = pred_g - gt_g;
-                const float db = pred_b - gt_b;
-                ray_loss       = ray_w * (dr * dr + dg * dg + db * db);
-
-                const float g_r = 2.0f * ray_w * dr * inv_norm;
-                const float g_g = 2.0f * ray_w * dg * inv_norm;
-                const float g_b = 2.0f * ray_w * db * inv_norm;
-
-                float suffix_r = T;
-                float suffix_g = T;
-                float suffix_b = T;
-
-                for (int i = static_cast<int>(count) - 1; i >= 0; --i) {
-                    const std::uint32_t s        = base + static_cast<std::uint32_t>(i);
-                    const float dt               = fmaxf(0.0f, sample_steps[s].dt);
-                    const float sig_raw          = raw_sigma[s];
-                    const float sigma            = softplus_sigma(sig_raw);
-                    const float exp_neg_sigma_dt = __expf(-(sigma * dt));
-                    const float a                = 1.0f - exp_neg_sigma_dt;
-                    const float one_minus_a      = fmaxf(1e-6f, 1.0f - a);
-
-                    const float r       = sigmoid_raw(raw_rgb[static_cast<std::uint64_t>(s) * 3ull + 0ull]);
-                    const float g       = sigmoid_raw(raw_rgb[static_cast<std::uint64_t>(s) * 3ull + 1ull]);
-                    const float b       = sigmoid_raw(raw_rgb[static_cast<std::uint64_t>(s) * 3ull + 2ull]);
-                    const float trans_i = trans_tmp[s];
-                    const float w       = trans_i * a;
-
-                    const float dC_da_r = trans_i * r - suffix_r / one_minus_a;
-                    const float dC_da_g = trans_i * g - suffix_g / one_minus_a;
-                    const float dC_da_b = trans_i * b - suffix_b / one_minus_a;
-                    const float dL_da   = g_r * dC_da_r + g_g * dC_da_g + g_b * dC_da_b;
-
-                    const float dsigma_draw = sigmoid_raw(sig_raw);
-                    d_raw_sigma[s]          = dL_da * dt * exp_neg_sigma_dt * dsigma_draw;
-
-                    const float wr                                         = w * g_r;
-                    const float wg                                         = w * g_g;
-                    const float wb                                         = w * g_b;
-                    d_raw_rgb[static_cast<std::uint64_t>(s) * 3ull + 0ull] = wr * r * (1.0f - r);
-                    d_raw_rgb[static_cast<std::uint64_t>(s) * 3ull + 1ull] = wg * g * (1.0f - g);
-                    d_raw_rgb[static_cast<std::uint64_t>(s) * 3ull + 2ull] = wb * b * (1.0f - b);
-
-                    suffix_r += w * r;
-                    suffix_g += w * g;
-                    suffix_b += w * b;
-                }
-            }
+        if (!fully_fused_mlp_inference(network_set.density, stream, workspace.density_input, padded_rows, workspace.density_output)) {
+            return false;
         }
 
-        __shared__ float block_loss[256];
-        block_loss[threadIdx.x] = ray_loss;
-        __syncthreads();
-        for (std::uint32_t stride = blockDim.x >> 1u; stride > 0u; stride >>= 1u) {
-            if (threadIdx.x < stride) block_loss[threadIdx.x] += block_loss[threadIdx.x + stride];
-            __syncthreads();
-        }
-        if (threadIdx.x == 0u) atomicAdd(loss_sum, block_loss[0]);
+        k_unpack_density_sigma<<<(rows + threads - 1u) / threads, threads, 0, stream>>>(workspace.density_output, rows, raw_sigma);
+        return cudaGetLastError() == cudaSuccess;
     }
 
     bool run_network_training(NetworkSet& network_set, NetworkWorkspace& workspace, cudaStream_t stream, const NetworkTrainingRequest& request) {
@@ -1983,7 +2050,9 @@ namespace nerf::runtime {
         std::uint64_t bitfield_bytes            = 0u;
         float* density_grid                     = nullptr;
         std::uint32_t grid_res                  = 0u;
-        std::uint32_t max_update_tiles          = 0u;
+        std::uint32_t cell_count                = 0u;
+        std::uint32_t update_count              = 0u;
+        std::uint32_t update_rows_padded        = 0u;
         float decay                             = 0.98f;
         float threshold                         = 0.01f;
         std::uint32_t cells_per_update          = 65536u;
@@ -2057,6 +2126,22 @@ namespace nerf::runtime {
         x *= 0x846ca68bu;
         x ^= x >> 16u;
         return x;
+    }
+
+    __host__ __device__ __forceinline__ std::uint32_t round_up_u32(const std::uint32_t value, const std::uint32_t alignment) {
+        return alignment == 0u ? 0u : ((value + alignment - 1u) / alignment) * alignment;
+    }
+
+    __host__ __device__ __forceinline__ std::uint32_t occupancy_cell_count_u32(const std::uint32_t grid_res) {
+        return static_cast<std::uint32_t>(static_cast<std::uint64_t>(grid_res) * static_cast<std::uint64_t>(grid_res) * static_cast<std::uint64_t>(grid_res));
+    }
+
+    __host__ __device__ __forceinline__ bool occupancy_in_warmup(const OccupancyUpdateRequest& request, const std::uint32_t frame_index) {
+        return frame_index < request.warmup_steps;
+    }
+
+    __host__ __device__ __forceinline__ bool occupancy_should_refresh(const OccupancyUpdateRequest& request, const std::uint32_t frame_index) {
+        return !occupancy_in_warmup(request, frame_index) && (frame_index == 0u || (frame_index % request.update_interval) == 0u);
     }
 
     __global__ void k_float_to_half(const float* src, __half* dst, std::uint32_t n) {
@@ -2151,43 +2236,27 @@ namespace nerf::runtime {
         params[idx]     = __float2half_rn(w);
     }
 
-    __global__ void k_prepare_update_density_grid(float* data, const std::uint32_t count, const float decay, const std::uint32_t update_interval, const std::uint32_t warmup_steps, const TrainingDeviceState* state) {
+    __global__ void k_fill_float(float* data, const std::uint32_t count, const float value) {
         const std::uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-        if (idx >= count) return;
-        if (state->frame_index < warmup_steps)
-            data[idx] = 1.0f;
-        else if (state->frame_index == 0u || state->frame_index % update_interval == 0u)
-            data[idx] *= decay;
+        if (idx < count) data[idx] = value;
     }
 
-    __global__ void k_prepare_occupancy_bitfield(std::uint32_t* bitfield, const std::uint32_t word_count, const std::uint32_t update_interval, const std::uint32_t warmup_steps, const TrainingDeviceState* state) {
+    __global__ void k_scale_float(float* data, const std::uint32_t count, const float scale) {
         const std::uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-        if (idx >= word_count) return;
-        if (state->frame_index < warmup_steps)
-            bitfield[idx] = 0xFFFFFFFFu;
-        else if (state->frame_index == 0u || state->frame_index % update_interval == 0u)
-            bitfield[idx] = 0u;
+        if (idx < count) data[idx] *= scale;
     }
 
-    __global__ void k_build_occ_inputs(const TrainingDeviceState* state, const std::uint32_t total_rows, const std::uint32_t cells_per_update, const std::uint32_t cell_count, const std::uint32_t grid_res, const std::uint32_t warmup_steps, const std::uint32_t update_interval, const float3 aabb_min, const float3 aabb_max, float* out_inputs) {
+    __global__ void k_fill_u32(std::uint32_t* data, const std::uint32_t count, const std::uint32_t value) {
         const std::uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-        if (idx >= total_rows) return;
+        if (idx < count) data[idx] = value;
+    }
 
-        if (state->frame_index < warmup_steps || (state->frame_index >= warmup_steps && state->frame_index != 0u && state->frame_index % update_interval != 0u)) {
-            float* dst = out_inputs + static_cast<std::uint64_t>(idx) * 7ull;
-            dst[0]     = 0.0f;
-            dst[1]     = 0.0f;
-            dst[2]     = 0.0f;
-            dst[3]     = 0.0f;
-            dst[4]     = 0.0f;
-            dst[5]     = 0.0f;
-            dst[6]     = 1.0f;
-            return;
-        }
-        const std::uint32_t update_count = min(cells_per_update, cell_count);
-        const std::uint32_t linear_idx   = idx;
-        float* dst                       = out_inputs + static_cast<std::uint64_t>(idx) * 7ull;
-        if (linear_idx >= update_count) {
+    __global__ void k_build_occ_inputs(const std::uint32_t frame_index, const std::uint32_t rows, const std::uint32_t update_count, const std::uint32_t cell_count, const std::uint32_t grid_res, const float3 aabb_min, const float3 aabb_max, float* out_inputs) {
+        const std::uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+        if (idx >= rows) return;
+
+        float* dst = out_inputs + static_cast<std::uint64_t>(idx) * 7ull;
+        if (idx >= update_count) {
             dst[0] = 0.0f;
             dst[1] = 0.0f;
             dst[2] = 0.0f;
@@ -2198,8 +2267,8 @@ namespace nerf::runtime {
             return;
         }
 
-        const std::uint32_t start_cell_base = static_cast<std::uint32_t>(static_cast<std::uint64_t>(state->frame_index) * update_count % cell_count);
-        const std::uint32_t cell            = (start_cell_base + linear_idx) % cell_count;
+        const std::uint32_t start_cell_base = static_cast<std::uint32_t>(static_cast<std::uint64_t>(frame_index) * update_count % cell_count);
+        const std::uint32_t cell            = (start_cell_base + idx) % cell_count;
         const std::uint32_t layer           = grid_res * grid_res;
         const std::uint32_t z               = cell / layer;
         const std::uint32_t rem             = cell - z * layer;
@@ -2217,26 +2286,20 @@ namespace nerf::runtime {
         dst[6] = 1.0f;
     }
 
-    __global__ void k_update_density_from_sigma(float* density_grid, const float* raw_sigma, const TrainingDeviceState* state, const std::uint32_t total_rows, const std::uint32_t cells_per_update, const std::uint32_t cell_count, const std::uint32_t warmup_steps, const std::uint32_t update_interval) {
+    __global__ void k_update_density_from_sigma(float* density_grid, const float* raw_sigma, const std::uint32_t frame_index, const std::uint32_t update_count, const std::uint32_t cell_count) {
         const std::uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-        if (idx >= total_rows) return;
-        if (state->frame_index < warmup_steps) return;
-        if (state->frame_index >= warmup_steps && state->frame_index != 0u && state->frame_index % update_interval != 0u) return;
-        const std::uint32_t update_count = min(cells_per_update, cell_count);
-        const std::uint32_t linear_idx   = idx;
-        if (linear_idx >= update_count) return;
-        const std::uint32_t start_cell_base = static_cast<std::uint32_t>(static_cast<std::uint64_t>(state->frame_index) * update_count % cell_count);
-        const std::uint32_t cell            = (start_cell_base + linear_idx) % cell_count;
+        if (idx >= update_count) return;
+
+        const std::uint32_t start_cell_base = static_cast<std::uint32_t>(static_cast<std::uint64_t>(frame_index) * update_count % cell_count);
+        const std::uint32_t cell            = (start_cell_base + idx) % cell_count;
         const float sig_raw                 = raw_sigma[idx];
         const float sigma                   = sig_raw > 20.0f ? sig_raw : sig_raw < -20.0f ? __expf(sig_raw) : log1pf(__expf(sig_raw));
         density_grid[cell]                  = fmaxf(density_grid[cell], sigma);
     }
 
-    __global__ void k_rebuild_occ_from_density(const float* density_grid, const std::uint32_t cell_count, const float threshold, const std::uint32_t warmup_steps, const std::uint32_t update_interval, const TrainingDeviceState* state, std::uint32_t* bitfield) {
+    __global__ void k_rebuild_occ_from_density(const float* density_grid, const std::uint32_t cell_count, const float threshold, std::uint32_t* bitfield) {
         const std::uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
         if (idx >= cell_count) return;
-        if (state->frame_index < warmup_steps) return;
-        if (state->frame_index >= warmup_steps && state->frame_index != 0u && state->frame_index % update_interval != 0u) return;
         if (density_grid[idx] <= threshold) return;
         atomicOr(&bitfield[idx >> 5u], 1u << (idx & 31u));
     }
@@ -2745,21 +2808,25 @@ NerfStatus nerf_configure_training(void* context, const NerfTrainingConfig* conf
     const std::uint64_t total_sample_steps = static_cast<std::uint64_t>(normalized.rays_per_batch) * static_cast<std::uint64_t>(normalized.max_sample_steps_per_ray);
     if (total_sample_steps > static_cast<std::uint64_t>(ctx->max_sample_steps)) return NERF_STATUS_RANGE_ERROR;
 
-    const std::uint32_t occupancy_cell_count = static_cast<std::uint32_t>(static_cast<std::uint64_t>(ctx->occupancy_grid_res) * static_cast<std::uint64_t>(ctx->occupancy_grid_res) * static_cast<std::uint64_t>(ctx->occupancy_grid_res));
+    const std::uint32_t occupancy_cell_count         = nerf::runtime::occupancy_cell_count_u32(ctx->occupancy_grid_res);
+    const std::uint32_t occupancy_update_count       = std::min<std::uint32_t>(normalized.occupancy_params.cells_per_update, occupancy_cell_count);
+    const std::uint32_t occupancy_update_rows_padded = nerf::runtime::round_up_u32(occupancy_update_count, kNetworkBatchGranularity);
     const nerf::runtime::OccupancyUpdateRequest occupancy_request{
-        .device_state     = runtime->device_state,
-        .bitfield         = reinterpret_cast<std::uint32_t*>(ctx->occupancy_bitfield.ptr),
-        .bitfield_bytes   = ctx->occupancy_bitfield.size_bytes,
-        .density_grid     = reinterpret_cast<float*>(ctx->occupancy_density.ptr),
-        .grid_res         = ctx->occupancy_grid_res,
-        .max_update_tiles = ((std::min<std::uint32_t>(normalized.occupancy_params.cells_per_update, occupancy_cell_count) + kTrainChunkRows - 1u) / kTrainChunkRows),
-        .decay            = normalized.occupancy_params.decay,
-        .threshold        = normalized.occupancy_params.threshold,
-        .cells_per_update = normalized.occupancy_params.cells_per_update,
-        .update_interval  = normalized.occupancy_params.update_interval,
-        .warmup_steps     = normalized.occupancy_params.warmup_steps,
-        .aabb_min         = float3{normalized.aabb_min.x, normalized.aabb_min.y, normalized.aabb_min.z},
-        .aabb_max         = float3{normalized.aabb_max.x, normalized.aabb_max.y, normalized.aabb_max.z},
+        .device_state       = runtime->device_state,
+        .bitfield           = reinterpret_cast<std::uint32_t*>(ctx->occupancy_bitfield.ptr),
+        .bitfield_bytes     = ctx->occupancy_bitfield.size_bytes,
+        .density_grid       = reinterpret_cast<float*>(ctx->occupancy_density.ptr),
+        .grid_res           = ctx->occupancy_grid_res,
+        .cell_count         = occupancy_cell_count,
+        .update_count       = occupancy_update_count,
+        .update_rows_padded = occupancy_update_rows_padded,
+        .decay              = normalized.occupancy_params.decay,
+        .threshold          = normalized.occupancy_params.threshold,
+        .cells_per_update   = normalized.occupancy_params.cells_per_update,
+        .update_interval    = normalized.occupancy_params.update_interval,
+        .warmup_steps       = normalized.occupancy_params.warmup_steps,
+        .aabb_min           = float3{normalized.aabb_min.x, normalized.aabb_min.y, normalized.aabb_min.z},
+        .aabb_max           = float3{normalized.aabb_max.x, normalized.aabb_max.y, normalized.aabb_max.z},
     };
     const nerf::sampler::SamplerRequest sampler_request{
         .stream                   = runtime->stream,
@@ -2795,14 +2862,14 @@ NerfStatus nerf_configure_training(void* context, const NerfTrainingConfig* conf
     };
     {
         std::scoped_lock run_lock(runtime->run_mutex);
-        const bool same_plan = runtime->training_configured && runtime->training_request.max_sample_step_count == training_request.max_sample_step_count && runtime->occupancy_request.max_update_tiles == occupancy_request.max_update_tiles && runtime->training_config.aabb_min.x == normalized.aabb_min.x && runtime->training_config.aabb_min.y == normalized.aabb_min.y && runtime->training_config.aabb_min.z == normalized.aabb_min.z
+        const bool same_plan = runtime->training_configured && runtime->training_request.max_sample_step_count == training_request.max_sample_step_count && runtime->occupancy_request.update_rows_padded == occupancy_request.update_rows_padded && runtime->training_config.aabb_min.x == normalized.aabb_min.x && runtime->training_config.aabb_min.y == normalized.aabb_min.y && runtime->training_config.aabb_min.z == normalized.aabb_min.z
                             && runtime->training_config.aabb_max.x == normalized.aabb_max.x && runtime->training_config.aabb_max.y == normalized.aabb_max.y && runtime->training_config.aabb_max.z == normalized.aabb_max.z && runtime->training_config.hyper_params.learning_rate == normalized.hyper_params.learning_rate && runtime->training_config.hyper_params.adam_beta1 == normalized.hyper_params.adam_beta1
                             && runtime->training_config.hyper_params.adam_beta2 == normalized.hyper_params.adam_beta2 && runtime->training_config.hyper_params.adam_eps == normalized.hyper_params.adam_eps && runtime->training_config.hyper_params.lr_decay_ksteps == normalized.hyper_params.lr_decay_ksteps && runtime->training_config.occupancy_params.decay == normalized.occupancy_params.decay
                             && runtime->training_config.occupancy_params.threshold == normalized.occupancy_params.threshold && runtime->training_config.occupancy_params.cells_per_update == normalized.occupancy_params.cells_per_update && runtime->training_config.occupancy_params.update_interval == normalized.occupancy_params.update_interval && runtime->training_config.occupancy_params.warmup_steps == normalized.occupancy_params.warmup_steps
                             && runtime->training_config.rays_per_batch == normalized.rays_per_batch && runtime->training_config.max_sample_steps_per_ray == normalized.max_sample_steps_per_ray;
         if (!same_plan) {
             if (cudaStreamSynchronize(runtime->stream) != cudaSuccess) return NERF_STATUS_INTERNAL_ERROR;
-            const std::uint32_t occupancy_rows = occupancy_request.max_update_tiles * kTrainChunkRows;
+            const std::uint32_t occupancy_rows = occupancy_request.update_rows_padded;
             const std::uint32_t workspace_rows = std::max(training_request.max_sample_step_count + kNetworkBatchGranularity, occupancy_rows);
             if (!nerf::runtime::alloc_workspace(runtime->workspace, workspace_rows)) return NERF_STATUS_INTERNAL_ERROR;
             runtime->training_config     = normalized;
@@ -2838,27 +2905,48 @@ NerfStatus nerf_train_step(void* context) {
     sampler_request.camera_idx                    = camera_idx;
 
     const nerf::runtime::OccupancyUpdateRequest& occupancy_request = runtime->occupancy_request;
-    const std::uint32_t cell_count                                 = static_cast<std::uint32_t>(static_cast<std::uint64_t>(occupancy_request.grid_res) * static_cast<std::uint64_t>(occupancy_request.grid_res) * static_cast<std::uint64_t>(occupancy_request.grid_res));
+    const std::uint32_t cell_count                                 = occupancy_request.cell_count;
     const std::uint32_t word_count                                 = static_cast<std::uint32_t>((occupancy_request.bitfield_bytes + sizeof(std::uint32_t) - 1u) / sizeof(std::uint32_t));
-    const std::uint32_t total_rows                                 = occupancy_request.max_update_tiles * kTrainChunkRows;
+    const std::uint32_t update_rows                                = occupancy_request.update_rows_padded;
     constexpr std::uint32_t block_x                                = kOccupancyBlockX;
     const dim3 full_grid((cell_count + block_x - 1u) / block_x);
     const dim3 word_grid((word_count + block_x - 1u) / block_x);
-    const dim3 tile_grid((total_rows + block_x - 1u) / block_x);
+    const dim3 update_grid((update_rows + block_x - 1u) / block_x);
 
-    nerf::runtime::k_prepare_update_density_grid<<<full_grid, block_x, 0, runtime->stream>>>(occupancy_request.density_grid, cell_count, occupancy_request.decay, occupancy_request.update_interval, occupancy_request.warmup_steps, occupancy_request.device_state);
-    if (const cudaError_t error = cudaGetLastError(); error != cudaSuccess) return NERF_STATUS_INTERNAL_ERROR;
-    nerf::runtime::k_prepare_occupancy_bitfield<<<word_grid, block_x, 0, runtime->stream>>>(occupancy_request.bitfield, word_count, occupancy_request.update_interval, occupancy_request.warmup_steps, occupancy_request.device_state);
-    if (const cudaError_t error = cudaGetLastError(); error != cudaSuccess) return NERF_STATUS_INTERNAL_ERROR;
-    if (total_rows != 0u) {
-        nerf::runtime::k_build_occ_inputs<<<tile_grid, block_x, 0, runtime->stream>>>(occupancy_request.device_state, total_rows, occupancy_request.cells_per_update, cell_count, occupancy_request.grid_res, occupancy_request.warmup_steps, occupancy_request.update_interval, occupancy_request.aabb_min, occupancy_request.aabb_max, runtime->workspace.inputs_tmp);
-        if (const cudaError_t error = cudaGetLastError(); error != cudaSuccess) return NERF_STATUS_INTERNAL_ERROR;
-        if (!nerf::encoder::run_encoder_module(runtime->stream, runtime->workspace.inputs_tmp, total_rows, runtime->workspace.enc_pts, runtime->workspace.enc_dir)) return NERF_STATUS_INTERNAL_ERROR;
-        if (!nerf::network::run_network_inference(runtime->network, runtime->workspace, runtime->stream, nerf::network::NetworkInferenceRequest{.encoded_pts = runtime->workspace.enc_pts, .encoded_dir = runtime->workspace.enc_dir, .rows = total_rows, .raw_rgb = runtime->workspace.raw_rgb, .raw_sigma = runtime->workspace.raw_sigma})) return NERF_STATUS_INTERNAL_ERROR;
-        nerf::runtime::k_update_density_from_sigma<<<tile_grid, block_x, 0, runtime->stream>>>(occupancy_request.density_grid, runtime->workspace.raw_sigma, occupancy_request.device_state, total_rows, occupancy_request.cells_per_update, cell_count, occupancy_request.warmup_steps, occupancy_request.update_interval);
-        if (const cudaError_t error = cudaGetLastError(); error != cudaSuccess) return NERF_STATUS_INTERNAL_ERROR;
-        nerf::runtime::k_rebuild_occ_from_density<<<full_grid, block_x, 0, runtime->stream>>>(occupancy_request.density_grid, cell_count, occupancy_request.threshold, occupancy_request.warmup_steps, occupancy_request.update_interval, occupancy_request.device_state, occupancy_request.bitfield);
+    const bool occ_warmup         = nerf::runtime::occupancy_in_warmup(occupancy_request, frame_index);
+    const bool occ_should_refresh = nerf::runtime::occupancy_should_refresh(occupancy_request, frame_index);
+
+    if (occ_warmup) {
+        nerf::runtime::k_fill_float<<<full_grid, block_x, 0, runtime->stream>>>(occupancy_request.density_grid, cell_count, 1.0f);
         if (cudaGetLastError() != cudaSuccess) return NERF_STATUS_INTERNAL_ERROR;
+
+        nerf::runtime::k_fill_u32<<<word_grid, block_x, 0, runtime->stream>>>(occupancy_request.bitfield, word_count, 0xFFFFFFFFu);
+        if (cudaGetLastError() != cudaSuccess) return NERF_STATUS_INTERNAL_ERROR;
+    } else if (occ_should_refresh) {
+        nerf::runtime::k_scale_float<<<full_grid, block_x, 0, runtime->stream>>>(occupancy_request.density_grid, cell_count, occupancy_request.decay);
+        if (cudaGetLastError() != cudaSuccess) return NERF_STATUS_INTERNAL_ERROR;
+
+        nerf::runtime::k_fill_u32<<<word_grid, block_x, 0, runtime->stream>>>(occupancy_request.bitfield, word_count, 0u);
+        if (cudaGetLastError() != cudaSuccess) return NERF_STATUS_INTERNAL_ERROR;
+
+        if (update_rows != 0u) {
+            nerf::runtime::k_build_occ_inputs<<<update_grid, block_x, 0, runtime->stream>>>(frame_index, update_rows, occupancy_request.update_count, occupancy_request.cell_count, occupancy_request.grid_res, occupancy_request.aabb_min, occupancy_request.aabb_max, runtime->workspace.inputs_tmp);
+            if (cudaGetLastError() != cudaSuccess) return NERF_STATUS_INTERNAL_ERROR;
+
+            if (!nerf::encoder::run_position_encoder_module(runtime->stream, runtime->workspace.inputs_tmp, update_rows, runtime->workspace.enc_pts)) {
+                return NERF_STATUS_INTERNAL_ERROR;
+            }
+
+            if (!nerf::network::run_density_inference(runtime->network, runtime->workspace, runtime->stream, runtime->workspace.enc_pts, update_rows, runtime->workspace.raw_sigma)) {
+                return NERF_STATUS_INTERNAL_ERROR;
+            }
+
+            nerf::runtime::k_update_density_from_sigma<<<update_grid, block_x, 0, runtime->stream>>>(occupancy_request.density_grid, runtime->workspace.raw_sigma, frame_index, occupancy_request.update_count, occupancy_request.cell_count);
+            if (cudaGetLastError() != cudaSuccess) return NERF_STATUS_INTERNAL_ERROR;
+
+            nerf::runtime::k_rebuild_occ_from_density<<<full_grid, block_x, 0, runtime->stream>>>(occupancy_request.density_grid, occupancy_request.cell_count, occupancy_request.threshold, occupancy_request.bitfield);
+            if (cudaGetLastError() != cudaSuccess) return NERF_STATUS_INTERNAL_ERROR;
+        }
     }
 
     nerf::runtime::k_begin_training_step<<<1, 1, 0, runtime->stream>>>(runtime->device_state, camera_idx);
