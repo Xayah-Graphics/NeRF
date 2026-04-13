@@ -2538,9 +2538,9 @@ NerfStatus nerf_train_step(void* context) {
     const dim3 update_grid((update_rows + block_x - 1u) / block_x);
 
     const bool occ_warmup         = frame_index < occupancy_request.warmup_steps;
-    const bool occ_should_refresh = !occ_warmup && (frame_index == 0u || (frame_index % occupancy_request.update_interval) == 0u);
+    const bool occ_should_refresh = !occ_warmup && ((frame_index % occupancy_request.update_interval) == 0u);
 
-    if (occ_warmup) {
+    if (occ_warmup && frame_index == 0u) {
         nerf::runtime::k_fill_float<<<full_grid, block_x, 0, runtime->stream>>>(occupancy_request.density_grid, cell_count, 1.0f);
         if (cudaGetLastError() != cudaSuccess) return NERF_STATUS_INTERNAL_ERROR;
 
@@ -2561,9 +2561,8 @@ NerfStatus nerf_train_step(void* context) {
                 return NERF_STATUS_INTERNAL_ERROR;
             }
 
-            if (!nerf::network::run_density_inference(runtime->network, runtime->workspace, runtime->stream, runtime->workspace.enc_pts, update_rows, runtime->workspace.raw_sigma)) {
+            if (!nerf::network::run_density_inference(runtime->network, runtime->workspace, runtime->stream, runtime->workspace.enc_pts, update_rows, runtime->workspace.raw_sigma))
                 return NERF_STATUS_INTERNAL_ERROR;
-            }
 
             nerf::runtime::k_update_density_from_sigma<<<update_grid, block_x, 0, runtime->stream>>>(occupancy_request.density_grid, runtime->workspace.raw_sigma, frame_index, occupancy_request.update_count, occupancy_request.cell_count);
             if (cudaGetLastError() != cudaSuccess) return NERF_STATUS_INTERNAL_ERROR;
