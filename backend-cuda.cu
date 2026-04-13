@@ -2032,9 +2032,9 @@ namespace nerf::runtime {
     };
 
     struct ContextStorage {
-        DeviceContext* cuda_context = nullptr;
-        std::byte* scratch_device_base             = nullptr;
-        std::byte* scene_device_base               = nullptr;
+        DeviceContext* cuda_context    = nullptr;
+        std::byte* scratch_device_base = nullptr;
+        std::byte* scene_device_base   = nullptr;
         DeviceSpan images{};
         DeviceSpan xforms{};
         DeviceSpan occupancy_bitfield{};
@@ -2571,7 +2571,7 @@ NerfStatus nerf_create_context(const NerfCreateDesc* desc, void** out_context) {
     }
 
     std::unique_ptr<nerf::runtime::DeviceContext> cuda_context = std::make_unique<nerf::runtime::DeviceContext>();
-    std::unique_ptr<nerf::runtime::ContextStorage> context                    = std::make_unique<nerf::runtime::ContextStorage>();
+    std::unique_ptr<nerf::runtime::ContextStorage> context     = std::make_unique<nerf::runtime::ContextStorage>();
     context->cuda_context                                      = cuda_context.release();
     context->occupancy_grid_res                                = normalized.occupancy_grid_res;
     context->max_sample_steps                                  = normalized.max_sample_steps;
@@ -2657,8 +2657,8 @@ NerfStatus nerf_load_dataset(void* context, const NerfDatasetLoadDesc* desc, Ner
     {
         std::scoped_lock lock(ctx->cuda_context->train_runtime_mutex);
         std::shared_ptr<nerf::runtime::TrainRuntime> runtime = ctx->cuda_context->train_runtime;
-        runtime->training_configured = false;
-        runtime->host_frame_index    = 0u;
+        runtime->training_configured                         = false;
+        runtime->host_frame_index                            = 0u;
     }
 
     if (ctx->scene_device_base) {
@@ -2831,8 +2831,7 @@ NerfStatus nerf_train_step(void* context) {
 
     const std::uint32_t frame_index  = runtime->host_frame_index;
     const std::uint32_t camera_count = runtime->training_request.camera_count;
-    std::uint32_t camera_idx         = 0u;
-    if (camera_count != 0u) camera_idx = nerf::runtime::hash_u32(frame_index * 747796405u + 2891336453u) % camera_count;
+    const std::uint32_t camera_idx   = nerf::runtime::hash_u32(frame_index * 747796405u + 2891336453u) % camera_count;
 
     nerf::sampler::SamplerRequest sampler_request = runtime->sampler_request;
     sampler_request.frame_index                   = frame_index;
