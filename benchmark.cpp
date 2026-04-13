@@ -20,7 +20,6 @@ struct HostDatasetData {
         uint32_t image_width;
         uint32_t image_height;
         uint64_t images_bytes;
-        uint64_t c2w_bytes;
         float fx;
         float fy;
         float cx;
@@ -104,7 +103,7 @@ static bool axis_to_basis_entry(const CoordAxis axis, std::uint32_t* out_axis, f
 }
 
 static NerfStatus fill_basis_matrix(const CoordBasis& basis, float out_matrix[9]) {
-    std::fill(out_matrix, out_matrix + 9, 0.0f);
+    std::fill_n(out_matrix, 9, 0.0f);
     const CoordAxis dirs[3] = {basis.x, basis.y, basis.z};
     std::uint32_t seen_axes = 0u;
     for (std::size_t c = 0u; c < 3u; ++c) {
@@ -191,8 +190,7 @@ static NerfStatus load_nerf_synthetic_host_dataset(const char* path_utf8, HostDa
 
     int first_width       = 0;
     int first_height      = 0;
-    int first_channels    = 0;
-    stbi_uc* first_pixels = stbi_load(image_paths[0].string().c_str(), &first_width, &first_height, &first_channels, 4);
+    stbi_uc* first_pixels = stbi_load(image_paths[0].string().c_str(), &first_width, &first_height, nullptr, 4);
     if (!first_pixels || first_width <= 0 || first_height <= 0) {
         if (first_pixels) stbi_image_free(first_pixels);
         return NERF_STATUS_INTERNAL_ERROR;
@@ -221,8 +219,7 @@ static NerfStatus load_nerf_synthetic_host_dataset(const char* path_utf8, HostDa
     for (std::size_t image_index = 1u; image_index < frame_count; ++image_index) {
         int width       = 0;
         int height      = 0;
-        int channels    = 0;
-        stbi_uc* pixels = stbi_load(image_paths[image_index].string().c_str(), &width, &height, &channels, 4);
+        stbi_uc* pixels = stbi_load(image_paths[image_index].string().c_str(), &width, &height, nullptr, 4);
         if (!pixels) return NERF_STATUS_INTERNAL_ERROR;
         if (width != first_width || height != first_height) {
             stbi_image_free(pixels);
@@ -322,7 +319,6 @@ static NerfStatus load_nerf_synthetic_host_dataset(const char* path_utf8, HostDa
                       .image_width  = static_cast<std::uint32_t>(first_width),
                       .image_height = static_cast<std::uint32_t>(first_height),
                       .images_bytes = total_image_bytes,
-                      .c2w_bytes    = static_cast<std::uint64_t>(out_data.cameras_4x4_packed.size()) * sizeof(float),
                       .fx           = fx,
                       .fy           = fy,
                       .cx           = cx,

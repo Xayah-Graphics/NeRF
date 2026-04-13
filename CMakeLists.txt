@@ -58,10 +58,6 @@ download_if_needed(
         "https://github.com/nlohmann/json/releases/download/v3.12.0/json.hpp"
         "${CMAKE_CURRENT_BINARY_DIR}/vendor/json/json.hpp"
 )
-download_if_needed(
-        "https://raw.githubusercontent.com/nothings/stb/28d546d5eb77d4585506a20480f4de2e706dff4c/stb_image.h"
-        "${CMAKE_CURRENT_BINARY_DIR}/vendor/stb/stb_image.h"
-)
 
 
 # ============================================================================
@@ -77,13 +73,17 @@ target_sources(
 )
 target_link_libraries(nerf PUBLIC CUDA::cudart CUDA::cuda_driver CUDA::cublas)
 target_compile_definitions(nerf PRIVATE NOMINMAX NERF_BUILD_SHARED NERF_BUILD_EXPORTS)
-target_include_directories(nerf PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
-target_include_directories(nerf PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/vendor/json")
+target_include_directories(nerf PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/vendor")
+
 
 # ============================================================================
 # Benchmark
 # ============================================================================
 if (NERF_BUILD_BENCHMARK)
+    download_if_needed(
+            "https://raw.githubusercontent.com/nothings/stb/28d546d5eb77d4585506a20480f4de2e706dff4c/stb_image.h"
+            "${CMAKE_CURRENT_BINARY_DIR}/vendor/stb/stb_image.h"
+    )
     add_executable(benchmark benchmark.cpp)
     target_link_libraries(benchmark PRIVATE nerf)
     target_include_directories(benchmark PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/vendor")

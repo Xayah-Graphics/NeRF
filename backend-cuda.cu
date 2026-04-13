@@ -16,7 +16,7 @@
 #include <vector>
 #include <vector_types.h>
 
-#include "json.hpp"
+#include "json/json.hpp"
 
 constexpr std::uint32_t kMaxSampleStepsPerRay = 256u;
 
@@ -25,9 +25,8 @@ constexpr std::uint32_t kDirFreqs = 4u;
 constexpr std::uint32_t kPtsInDim = 3u + 2u * 3u * kPosFreqs;
 constexpr std::uint32_t kDirInDim = 3u + 2u * 3u * kDirFreqs;
 
-constexpr std::uint32_t kTrainChunkRows              = 65536u;
-constexpr std::uint32_t kSamplerBlockRays            = 128u;
-constexpr std::uint32_t kSamplerMaxSampleStepsPerRay = 256u;
+constexpr std::uint32_t kTrainChunkRows   = 65536u;
+constexpr std::uint32_t kSamplerBlockRays = 128u;
 
 constexpr std::uint32_t kDensityInputDim             = 64u;
 constexpr std::uint32_t kDensityOutputDim            = 16u;
@@ -691,8 +690,8 @@ namespace nerf::sampler {
             const float dt_min     = t_range / static_cast<float>(max_sample_steps_per_ray);
             const float cone_angle = cone_angle_from_focal(shared_cam.fx, shared_cam.fy);
 
-            float sample_t_mid[kSamplerMaxSampleStepsPerRay];
-            float sample_dt[kSamplerMaxSampleStepsPerRay];
+            float sample_t_mid[kMaxSampleStepsPerRay];
+            float sample_dt[kMaxSampleStepsPerRay];
             std::uint32_t sample_count = 0u;
             std::uint32_t march_i      = 0u;
             float t                    = t_near;
