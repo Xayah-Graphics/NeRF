@@ -2706,73 +2706,76 @@ NerfStatus nerf_create_context(const NerfCreateDesc* desc, void** out_context) {
     std::uint64_t cursor = 0u;
     Region occupancy_bitfield{};
     Region occupancy_density{};
+    {
+        std::uint64_t cell_count = normalized.occupancy_grid_res;
+        if (cell_count > std::numeric_limits<std::uint64_t>::max() / static_cast<std::uint64_t>(normalized.occupancy_grid_res)) return NERF_STATUS_OVERFLOW;
+        cell_count *= static_cast<std::uint64_t>(normalized.occupancy_grid_res);
+        if (cell_count > std::numeric_limits<std::uint64_t>::max() / static_cast<std::uint64_t>(normalized.occupancy_grid_res)) return NERF_STATUS_OVERFLOW;
+        cell_count *= static_cast<std::uint64_t>(normalized.occupancy_grid_res);
+
+        const std::uint64_t bitfield_bytes = (cell_count + 31u) / 32u * sizeof(std::uint32_t);
+        std::uint64_t density_bytes        = cell_count;
+        if (density_bytes > std::numeric_limits<std::uint64_t>::max() / sizeof(float)) return NERF_STATUS_OVERFLOW;
+        density_bytes *= sizeof(float);
+
+        if (normalized.arena_alignment_bytes > 1u) {
+            if (cursor > std::numeric_limits<std::uint64_t>::max() - (normalized.arena_alignment_bytes - 1u)) return NERF_STATUS_OVERFLOW;
+            cursor = cursor + normalized.arena_alignment_bytes - 1u & ~(normalized.arena_alignment_bytes - 1u);
+        }
+        occupancy_bitfield.offset_bytes = cursor;
+        occupancy_bitfield.size_bytes   = bitfield_bytes;
+        if (cursor > std::numeric_limits<std::uint64_t>::max() - bitfield_bytes) return NERF_STATUS_OVERFLOW;
+        cursor += bitfield_bytes;
+
+        if (normalized.arena_alignment_bytes > 1u) {
+            if (cursor > std::numeric_limits<std::uint64_t>::max() - (normalized.arena_alignment_bytes - 1u)) return NERF_STATUS_OVERFLOW;
+            cursor = cursor + normalized.arena_alignment_bytes - 1u & ~(normalized.arena_alignment_bytes - 1u);
+        }
+        occupancy_density.offset_bytes = cursor;
+        occupancy_density.size_bytes   = density_bytes;
+        if (cursor > std::numeric_limits<std::uint64_t>::max() - density_bytes) return NERF_STATUS_OVERFLOW;
+        cursor += density_bytes;
+    }
+
     Region sample_rays{};
     Region sample_steps{};
     Region sample_batch_state{};
+    {
+        std::uint64_t sample_ray_bytes = normalized.max_batch_rays;
+        if (sample_ray_bytes > std::numeric_limits<std::uint64_t>::max() / sizeof(nerf::sampler::SampleRay)) return NERF_STATUS_OVERFLOW;
+        sample_ray_bytes *= sizeof(nerf::sampler::SampleRay);
 
-    std::uint64_t cell_count = normalized.occupancy_grid_res;
-    if (cell_count > std::numeric_limits<std::uint64_t>::max() / static_cast<std::uint64_t>(normalized.occupancy_grid_res)) return NERF_STATUS_OVERFLOW;
-    cell_count *= static_cast<std::uint64_t>(normalized.occupancy_grid_res);
-    if (cell_count > std::numeric_limits<std::uint64_t>::max() / static_cast<std::uint64_t>(normalized.occupancy_grid_res)) return NERF_STATUS_OVERFLOW;
-    cell_count *= static_cast<std::uint64_t>(normalized.occupancy_grid_res);
+        std::uint64_t sample_step_bytes = normalized.max_sample_steps;
+        if (sample_step_bytes > std::numeric_limits<std::uint64_t>::max() / sizeof(nerf::sampler::SampleStep)) return NERF_STATUS_OVERFLOW;
+        sample_step_bytes *= sizeof(nerf::sampler::SampleStep);
 
-    const std::uint64_t bitfield_bytes = (cell_count + 31u) / 32u * sizeof(std::uint32_t);
-    std::uint64_t density_bytes        = cell_count;
-    if (density_bytes > std::numeric_limits<std::uint64_t>::max() / sizeof(float)) return NERF_STATUS_OVERFLOW;
-    density_bytes *= sizeof(float);
+        if (normalized.arena_alignment_bytes > 1u) {
+            if (cursor > std::numeric_limits<std::uint64_t>::max() - (normalized.arena_alignment_bytes - 1u)) return NERF_STATUS_OVERFLOW;
+            cursor = cursor + normalized.arena_alignment_bytes - 1u & ~(normalized.arena_alignment_bytes - 1u);
+        }
+        sample_rays.offset_bytes = cursor;
+        sample_rays.size_bytes   = sample_ray_bytes;
+        if (cursor > std::numeric_limits<std::uint64_t>::max() - sample_ray_bytes) return NERF_STATUS_OVERFLOW;
+        cursor += sample_ray_bytes;
 
-    if (normalized.arena_alignment_bytes > 1u) {
-        if (cursor > std::numeric_limits<std::uint64_t>::max() - (normalized.arena_alignment_bytes - 1u)) return NERF_STATUS_OVERFLOW;
-        cursor = cursor + normalized.arena_alignment_bytes - 1u & ~(normalized.arena_alignment_bytes - 1u);
+        if (normalized.arena_alignment_bytes > 1u) {
+            if (cursor > std::numeric_limits<std::uint64_t>::max() - (normalized.arena_alignment_bytes - 1u)) return NERF_STATUS_OVERFLOW;
+            cursor = cursor + normalized.arena_alignment_bytes - 1u & ~(normalized.arena_alignment_bytes - 1u);
+        }
+        sample_steps.offset_bytes = cursor;
+        sample_steps.size_bytes   = sample_step_bytes;
+        if (cursor > std::numeric_limits<std::uint64_t>::max() - sample_step_bytes) return NERF_STATUS_OVERFLOW;
+        cursor += sample_step_bytes;
+
+        if (normalized.arena_alignment_bytes > 1u) {
+            if (cursor > std::numeric_limits<std::uint64_t>::max() - (normalized.arena_alignment_bytes - 1u)) return NERF_STATUS_OVERFLOW;
+            cursor = cursor + normalized.arena_alignment_bytes - 1u & ~(normalized.arena_alignment_bytes - 1u);
+        }
+        sample_batch_state.offset_bytes = cursor;
+        sample_batch_state.size_bytes   = sizeof(nerf::sampler::SampleBatchState);
+        if (cursor > std::numeric_limits<std::uint64_t>::max() - sample_batch_state.size_bytes) return NERF_STATUS_OVERFLOW;
+        cursor += sample_batch_state.size_bytes;
     }
-    occupancy_bitfield.offset_bytes = cursor;
-    occupancy_bitfield.size_bytes   = bitfield_bytes;
-    if (cursor > std::numeric_limits<std::uint64_t>::max() - bitfield_bytes) return NERF_STATUS_OVERFLOW;
-    cursor += bitfield_bytes;
-
-    if (normalized.arena_alignment_bytes > 1u) {
-        if (cursor > std::numeric_limits<std::uint64_t>::max() - (normalized.arena_alignment_bytes - 1u)) return NERF_STATUS_OVERFLOW;
-        cursor = cursor + normalized.arena_alignment_bytes - 1u & ~(normalized.arena_alignment_bytes - 1u);
-    }
-    occupancy_density.offset_bytes = cursor;
-    occupancy_density.size_bytes   = density_bytes;
-    if (cursor > std::numeric_limits<std::uint64_t>::max() - density_bytes) return NERF_STATUS_OVERFLOW;
-    cursor += density_bytes;
-
-    std::uint64_t sample_ray_bytes = normalized.max_batch_rays;
-    if (sample_ray_bytes > std::numeric_limits<std::uint64_t>::max() / sizeof(nerf::sampler::SampleRay)) return NERF_STATUS_OVERFLOW;
-    sample_ray_bytes *= sizeof(nerf::sampler::SampleRay);
-
-    std::uint64_t sample_step_bytes = normalized.max_sample_steps;
-    if (sample_step_bytes > std::numeric_limits<std::uint64_t>::max() / sizeof(nerf::sampler::SampleStep)) return NERF_STATUS_OVERFLOW;
-    sample_step_bytes *= sizeof(nerf::sampler::SampleStep);
-
-    if (normalized.arena_alignment_bytes > 1u) {
-        if (cursor > std::numeric_limits<std::uint64_t>::max() - (normalized.arena_alignment_bytes - 1u)) return NERF_STATUS_OVERFLOW;
-        cursor = cursor + normalized.arena_alignment_bytes - 1u & ~(normalized.arena_alignment_bytes - 1u);
-    }
-    sample_rays.offset_bytes = cursor;
-    sample_rays.size_bytes   = sample_ray_bytes;
-    if (cursor > std::numeric_limits<std::uint64_t>::max() - sample_ray_bytes) return NERF_STATUS_OVERFLOW;
-    cursor += sample_ray_bytes;
-
-    if (normalized.arena_alignment_bytes > 1u) {
-        if (cursor > std::numeric_limits<std::uint64_t>::max() - (normalized.arena_alignment_bytes - 1u)) return NERF_STATUS_OVERFLOW;
-        cursor = cursor + normalized.arena_alignment_bytes - 1u & ~(normalized.arena_alignment_bytes - 1u);
-    }
-    sample_steps.offset_bytes = cursor;
-    sample_steps.size_bytes   = sample_step_bytes;
-    if (cursor > std::numeric_limits<std::uint64_t>::max() - sample_step_bytes) return NERF_STATUS_OVERFLOW;
-    cursor += sample_step_bytes;
-
-    if (normalized.arena_alignment_bytes > 1u) {
-        if (cursor > std::numeric_limits<std::uint64_t>::max() - (normalized.arena_alignment_bytes - 1u)) return NERF_STATUS_OVERFLOW;
-        cursor = cursor + normalized.arena_alignment_bytes - 1u & ~(normalized.arena_alignment_bytes - 1u);
-    }
-    sample_batch_state.offset_bytes = cursor;
-    sample_batch_state.size_bytes   = sizeof(nerf::sampler::SampleBatchState);
-    if (cursor > std::numeric_limits<std::uint64_t>::max() - sample_batch_state.size_bytes) return NERF_STATUS_OVERFLOW;
-    cursor += sample_batch_state.size_bytes;
 
     std::unique_ptr<nerf::runtime::DeviceContext> cuda_context = std::make_unique<nerf::runtime::DeviceContext>();
     std::unique_ptr<ContextStorage> context                    = std::make_unique<ContextStorage>();
