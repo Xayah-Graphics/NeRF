@@ -415,6 +415,34 @@ namespace nerf::io {
 
 namespace nerf::encoder {
     namespace {
+        __device__ __forceinline__ void encode_position_with_freq(const float px, const float py, const float pz, float* __restrict__ out, const std::uint32_t max_freqs) {
+            out[0] = px;
+            out[1] = py;
+            out[2] = pz;
+
+            std::uint32_t offset = 3u;
+            float freq           = 1.0f;
+            for (std::uint32_t l = 0u; l < max_freqs; ++l) {
+                const float ax = px * freq;
+                const float ay = py * freq;
+                const float az = pz * freq;
+                float sx = 0.0f, cx = 0.0f;
+                float sy = 0.0f, cy = 0.0f;
+                float sz = 0.0f, cz = 0.0f;
+                __sincosf(ax, &sx, &cx);
+                __sincosf(ay, &sy, &cy);
+                __sincosf(az, &sz, &cz);
+                out[offset + 0u] = sx;
+                out[offset + 1u] = sy;
+                out[offset + 2u] = sz;
+                out[offset + 3u] = cx;
+                out[offset + 4u] = cy;
+                out[offset + 5u] = cz;
+                offset += 6u;
+                freq *= 2.0f;
+            }
+        }
+
         __global__ void k_encode_sample_inputs(const float* __restrict__ inputs, const std::uint32_t rows, float* __restrict__ enc_pts, float* __restrict__ enc_dir) {
             const std::uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
             if (idx >= rows) return;
@@ -430,57 +458,8 @@ namespace nerf::encoder {
             float* out_p = enc_pts + static_cast<std::uint64_t>(idx) * kPtsInDim;
             float* out_d = enc_dir + static_cast<std::uint64_t>(idx) * kDirInDim;
 
-            out_p[0] = px;
-            out_p[1] = py;
-            out_p[2] = pz;
-
-            std::uint32_t p_off = 3u;
-            float p_freq        = 1.0f;
-            for (std::uint32_t l = 0; l < kPosFreqs; ++l) {
-                const float ax = px * p_freq;
-                const float ay = py * p_freq;
-                const float az = pz * p_freq;
-                float sx = 0.0f, cx = 0.0f;
-                float sy = 0.0f, cy = 0.0f;
-                float sz = 0.0f, cz = 0.0f;
-                __sincosf(ax, &sx, &cx);
-                __sincosf(ay, &sy, &cy);
-                __sincosf(az, &sz, &cz);
-                out_p[p_off + 0u] = sx;
-                out_p[p_off + 1u] = sy;
-                out_p[p_off + 2u] = sz;
-                out_p[p_off + 3u] = cx;
-                out_p[p_off + 4u] = cy;
-                out_p[p_off + 5u] = cz;
-                p_off += 6u;
-                p_freq *= 2.0f;
-            }
-
-            out_d[0] = dx;
-            out_d[1] = dy;
-            out_d[2] = dz;
-
-            std::uint32_t d_off = 3u;
-            float d_freq        = 1.0f;
-            for (std::uint32_t l = 0; l < kDirFreqs; ++l) {
-                const float ax = dx * d_freq;
-                const float ay = dy * d_freq;
-                const float az = dz * d_freq;
-                float sx = 0.0f, cx = 0.0f;
-                float sy = 0.0f, cy = 0.0f;
-                float sz = 0.0f, cz = 0.0f;
-                __sincosf(ax, &sx, &cx);
-                __sincosf(ay, &sy, &cy);
-                __sincosf(az, &sz, &cz);
-                out_d[d_off + 0u] = sx;
-                out_d[d_off + 1u] = sy;
-                out_d[d_off + 2u] = sz;
-                out_d[d_off + 3u] = cx;
-                out_d[d_off + 4u] = cy;
-                out_d[d_off + 5u] = cz;
-                d_off += 6u;
-                d_freq *= 2.0f;
-            }
+            encode_position_with_freq(px, py, pz, out_p, kPosFreqs);
+            encode_position_with_freq(dx, dy, dz, out_d, kDirFreqs);
         }
 
         __global__ void k_encode_positions_only(const float* __restrict__ inputs, const std::uint32_t rows, float* __restrict__ enc_pts) {
@@ -493,32 +472,7 @@ namespace nerf::encoder {
             const float pz              = inputs[in_base + 2u];
 
             float* out_p = enc_pts + static_cast<std::uint64_t>(idx) * kPtsInDim;
-
-            out_p[0] = px;
-            out_p[1] = py;
-            out_p[2] = pz;
-
-            std::uint32_t p_off = 3u;
-            float p_freq        = 1.0f;
-            for (std::uint32_t l = 0u; l < kPosFreqs; ++l) {
-                const float ax = px * p_freq;
-                const float ay = py * p_freq;
-                const float az = pz * p_freq;
-                float sx = 0.0f, cx = 0.0f;
-                float sy = 0.0f, cy = 0.0f;
-                float sz = 0.0f, cz = 0.0f;
-                __sincosf(ax, &sx, &cx);
-                __sincosf(ay, &sy, &cy);
-                __sincosf(az, &sz, &cz);
-                out_p[p_off + 0u] = sx;
-                out_p[p_off + 1u] = sy;
-                out_p[p_off + 2u] = sz;
-                out_p[p_off + 3u] = cx;
-                out_p[p_off + 4u] = cy;
-                out_p[p_off + 5u] = cz;
-                p_off += 6u;
-                p_freq *= 2.0f;
-            }
+            encode_position_with_freq(px, py, pz, out_p, kPosFreqs);
         }
     } // namespace
 
@@ -1723,22 +1677,6 @@ namespace nerf::runtime {
         return x;
     }
 
-    __host__ __device__ __forceinline__ std::uint32_t round_up_u32(const std::uint32_t value, const std::uint32_t alignment) {
-        return alignment == 0u ? 0u : ((value + alignment - 1u) / alignment) * alignment;
-    }
-
-    __host__ __device__ __forceinline__ std::uint32_t occupancy_cell_count_u32(const std::uint32_t grid_res) {
-        return static_cast<std::uint32_t>(static_cast<std::uint64_t>(grid_res) * static_cast<std::uint64_t>(grid_res) * static_cast<std::uint64_t>(grid_res));
-    }
-
-    __host__ __device__ __forceinline__ bool occupancy_in_warmup(const OccupancyUpdateRequest& request, const std::uint32_t frame_index) {
-        return frame_index < request.warmup_steps;
-    }
-
-    __host__ __device__ __forceinline__ bool occupancy_should_refresh(const OccupancyUpdateRequest& request, const std::uint32_t frame_index) {
-        return !occupancy_in_warmup(request, frame_index) && (frame_index == 0u || (frame_index % request.update_interval) == 0u);
-    }
-
     __global__ void k_float_to_half(const float* src, __half* dst, std::uint32_t n) {
         const std::uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
         if (idx < n) dst[idx] = __float2half_rn(src[idx]);
@@ -2494,9 +2432,9 @@ NerfStatus nerf_configure_training(void* context, const NerfTrainingConfig* conf
     const std::uint64_t total_sample_steps = static_cast<std::uint64_t>(normalized.rays_per_batch) * static_cast<std::uint64_t>(normalized.max_sample_steps_per_ray);
     if (total_sample_steps > static_cast<std::uint64_t>(ctx->max_sample_steps)) return NERF_STATUS_RANGE_ERROR;
 
-    const std::uint32_t occupancy_cell_count         = nerf::runtime::occupancy_cell_count_u32(ctx->occupancy_grid_res);
+    const std::uint32_t occupancy_cell_count         = static_cast<std::uint32_t>(static_cast<std::uint64_t>(ctx->occupancy_grid_res) * static_cast<std::uint64_t>(ctx->occupancy_grid_res) * static_cast<std::uint64_t>(ctx->occupancy_grid_res));
     const std::uint32_t occupancy_update_count       = std::min<std::uint32_t>(normalized.occupancy_params.cells_per_update, occupancy_cell_count);
-    const std::uint32_t occupancy_update_rows_padded = nerf::runtime::round_up_u32(occupancy_update_count, kNetworkBatchGranularity);
+    const std::uint32_t occupancy_update_rows_padded = (occupancy_update_count + kNetworkBatchGranularity - 1u) / kNetworkBatchGranularity * kNetworkBatchGranularity;
     const nerf::runtime::OccupancyUpdateRequest occupancy_request{
         .device_state       = runtime->device_state,
         .bitfield           = reinterpret_cast<std::uint32_t*>(ctx->occupancy_bitfield.ptr),
@@ -2599,8 +2537,8 @@ NerfStatus nerf_train_step(void* context) {
     const dim3 word_grid((word_count + block_x - 1u) / block_x);
     const dim3 update_grid((update_rows + block_x - 1u) / block_x);
 
-    const bool occ_warmup         = nerf::runtime::occupancy_in_warmup(occupancy_request, frame_index);
-    const bool occ_should_refresh = nerf::runtime::occupancy_should_refresh(occupancy_request, frame_index);
+    const bool occ_warmup         = frame_index < occupancy_request.warmup_steps;
+    const bool occ_should_refresh = !occ_warmup && (frame_index == 0u || (frame_index % occupancy_request.update_interval) == 0u);
 
     if (occ_warmup) {
         nerf::runtime::k_fill_float<<<full_grid, block_x, 0, runtime->stream>>>(occupancy_request.density_grid, cell_count, 1.0f);
