@@ -2613,12 +2613,9 @@ NerfStatus nerf_train_step(void* context) {
         const float epsilon = runtime->training_request.train_cfg.adam_eps;
         if (!(beta1 >= 0.0f && beta1 < 1.0f && beta2 >= 0.0f && beta2 < 1.0f && epsilon > 0.0f && std::isfinite(epsilon))) return NERF_STATUS_INTERNAL_ERROR;
 
-        constexpr std::uint32_t threads = kThreads256;
         nerf::runtime::k_prepare_adam_step_scalars<<<1, 1, 0, runtime->stream>>>(runtime->device_state, runtime->training_request.train_cfg.learning_rate, beta1, beta2, runtime->training_request.train_cfg.lr_decay_ksteps, kInvLossScale, runtime->workspace.adam_step_scalars);
         if (cudaGetLastError() != cudaSuccess) return NERF_STATUS_INTERNAL_ERROR;
 
-        const std::uint32_t density_n = static_cast<std::uint32_t>(runtime->network.density.gradients.count);
-        const std::uint32_t color_n   = static_cast<std::uint32_t>(runtime->network.color.gradients.count);
         if (density_n != 0u) {
             nerf::runtime::k_adam_step_half<<<(density_n + threads - 1u) / threads, threads, 0, runtime->stream>>>(runtime->network.density.params_f32.ptr, runtime->network.density.params.ptr, runtime->network.density.gradients.ptr, runtime->network.density.adam_m.ptr, runtime->network.density.adam_v.ptr, density_n, beta1, beta2, epsilon, runtime->workspace.adam_step_scalars);
         }
