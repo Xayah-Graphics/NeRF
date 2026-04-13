@@ -240,11 +240,7 @@ int main(int argc, char** argv) {
         };
 
         for (std::uint32_t step = 0u; step < config.steps; ++step) {
-            const NerfStepRequest train_request{
-                .rays_per_batch           = config.rays_per_batch,
-                .max_sample_steps_per_ray = config.max_sample_steps_per_ray,
-            };
-            status = nerf_train_step(state.context, &train_request);
+            status = nerf_train_step(state.context);
             if (status != NERF_STATUS_OK) throw std::runtime_error("nerf_train_step failed: status=" + std::to_string(status));
 
             StepState step_state{};

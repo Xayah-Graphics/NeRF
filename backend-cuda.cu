@@ -2983,17 +2983,12 @@ NerfStatus nerf_configure_training(void* context, const NerfTrainingConfig* conf
     return NERF_STATUS_OK;
 }
 
-NerfStatus nerf_train_step(void* context, const NerfStepRequest* request) {
-    if (!context || !request) return NERF_STATUS_INVALID_ARGUMENT;
+NerfStatus nerf_train_step(void* context) {
+    if (!context) return NERF_STATUS_INVALID_ARGUMENT;
 
     const ContextStorage* ctx = static_cast<ContextStorage*>(context);
     if (!ctx->dataset_loaded) return NERF_STATUS_DATASET_NOT_LOADED;
     if (!ctx->training_configured) return NERF_STATUS_TRAINING_NOT_CONFIGURED;
-    if (request->rays_per_batch != ctx->training_config.rays_per_batch) return NERF_STATUS_CONFIGURATION_MISMATCH;
-    if (request->max_sample_steps_per_ray != ctx->training_config.max_sample_steps_per_ray) return NERF_STATUS_CONFIGURATION_MISMATCH;
-
-    const std::uint64_t total_sample_steps = static_cast<std::uint64_t>(request->rays_per_batch) * static_cast<std::uint64_t>(request->max_sample_steps_per_ray);
-    if (total_sample_steps > static_cast<std::uint64_t>(ctx->max_sample_steps)) return NERF_STATUS_RANGE_ERROR;
     if (!nerf::runtime::run_training_plan(ctx->cuda_context)) return NERF_STATUS_INTERNAL_ERROR;
     return NERF_STATUS_OK;
 }

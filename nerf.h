@@ -42,7 +42,6 @@ typedef enum NerfStatus {
     NERF_STATUS_INVALID_TRANSFORM_MATRIX      = 12,
     NERF_STATUS_IMAGE_LOAD_FAILED             = 13,
     NERF_STATUS_INCONSISTENT_IMAGE_RESOLUTION = 14,
-    NERF_STATUS_CONFIGURATION_MISMATCH        = 15,
     NERF_STATUS_CHECKPOINT_INVALID            = 16,
     NERF_STATUS_CHECKPOINT_MISMATCH           = 17
 } NerfStatus;
@@ -116,12 +115,7 @@ typedef struct NerfTrainingConfig {
     uint32_t max_sample_steps_per_ray;
 } NerfTrainingConfig;
 NERF_API NerfStatus nerf_configure_training(void* context, const NerfTrainingConfig* config);
-
-typedef struct NerfStepRequest {
-    uint32_t rays_per_batch;
-    uint32_t max_sample_steps_per_ray;
-} NerfStepRequest;
-NERF_API NerfStatus nerf_train_step(void* context, const NerfStepRequest* request);
+NERF_API NerfStatus nerf_train_step(void* context);
 
 typedef struct NerfTrainStats {
     float loss;
