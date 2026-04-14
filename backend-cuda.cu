@@ -1845,6 +1845,46 @@ namespace nerf::runtime {
     }
 } // namespace nerf::runtime
 
+static bool safe_mul_u64(const std::uint64_t a, const std::uint64_t b, std::uint64_t* out) {
+    if (!out) return false;
+    if (a != 0u && b > std::numeric_limits<std::uint64_t>::max() / a) return false;
+    *out = a * b;
+    return true;
+}
+
+static bool align_cursor(std::uint64_t* cursor, const std::uint64_t alignment) {
+    if (!cursor) return false;
+    if (alignment <= 1u) return true;
+    if (*cursor > std::numeric_limits<std::uint64_t>::max() - (alignment - 1u)) return false;
+    *cursor = (*cursor + alignment - 1u) & ~(alignment - 1u);
+    return true;
+}
+
+static bool reserve_region(std::uint64_t* cursor, const std::uint64_t alignment, const std::uint64_t size_bytes, nerf::runtime::Region* region) {
+    if (!cursor || !region) return false;
+    if (!align_cursor(cursor, alignment)) return false;
+    region->offset_bytes = *cursor;
+    region->size_bytes   = size_bytes;
+    if (*cursor > std::numeric_limits<std::uint64_t>::max() - size_bytes) return false;
+    *cursor += size_bytes;
+    return true;
+}
+
+static void reset_scene_views(nerf::runtime::ContextStorage* ctx) {
+    if (!ctx) return;
+    ctx->images          = {};
+    ctx->xforms          = {};
+    ctx->inference_rgba8 = {};
+}
+
+static NerfStatus release_scene_storage(nerf::runtime::ContextStorage* ctx) {
+    if (!ctx) return NERF_STATUS_INVALID_ARGUMENT;
+    if (ctx->scene_device_base && cudaFree(ctx->scene_device_base) != cudaSuccess) return NERF_STATUS_CUDA_FAILURE;
+    ctx->scene_device_base = nullptr;
+    reset_scene_views(ctx);
+    return NERF_STATUS_OK;
+}
+
 
 static NerfStatus upload_dataset_from_create_desc(nerf::runtime::ContextStorage* ctx, const NerfCreateDesc& desc) {
     if (!ctx) return NERF_STATUS_INVALID_ARGUMENT;
@@ -1857,12 +1897,6 @@ static NerfStatus upload_dataset_from_create_desc(nerf::runtime::ContextStorage*
     if (!std::isfinite(desc.fy) || !(desc.fy > 0.0f)) return NERF_STATUS_INVALID_ARGUMENT;
     if (!std::isfinite(desc.cx)) return NERF_STATUS_INVALID_ARGUMENT;
     if (!std::isfinite(desc.cy)) return NERF_STATUS_INVALID_ARGUMENT;
-    const auto safe_mul_u64 = [](const std::uint64_t a, const std::uint64_t b, std::uint64_t* out) -> bool {
-        if (!out) return false;
-        if (a != 0u && b > std::numeric_limits<std::uint64_t>::max() / a) return false;
-        *out = a * b;
-        return true;
-    };
     std::uint64_t expected_images_bytes = static_cast<std::uint64_t>(desc.image_count);
     if (!safe_mul_u64(expected_images_bytes, static_cast<std::uint64_t>(desc.image_width), &expected_images_bytes)) return NERF_STATUS_OVERFLOW;
     if (!safe_mul_u64(expected_images_bytes, static_cast<std::uint64_t>(desc.image_height), &expected_images_bytes)) return NERF_STATUS_OVERFLOW;
@@ -1882,13 +1916,7 @@ static NerfStatus upload_dataset_from_create_desc(nerf::runtime::ContextStorage*
         runtime->training_configured                         = false;
         runtime->host_frame_index                            = 0u;
     }
-    if (ctx->scene_device_base) {
-        if (cudaFree(ctx->scene_device_base) != cudaSuccess) return NERF_STATUS_CUDA_FAILURE;
-        ctx->scene_device_base = nullptr;
-    }
-    ctx->images          = {};
-    ctx->xforms          = {};
-    ctx->inference_rgba8 = {};
+    if (release_scene_storage(ctx) != NERF_STATUS_OK) return NERF_STATUS_CUDA_FAILURE;
     std::uint64_t cursor = 0u;
     nerf::runtime::Region images{};
     nerf::runtime::Region xforms{};
@@ -1897,30 +1925,9 @@ static NerfStatus upload_dataset_from_create_desc(nerf::runtime::ContextStorage*
         std::uint64_t inference_bytes = static_cast<std::uint64_t>(desc.image_width);
         if (!safe_mul_u64(inference_bytes, static_cast<std::uint64_t>(desc.image_height), &inference_bytes)) return NERF_STATUS_OVERFLOW;
         if (!safe_mul_u64(inference_bytes, 4u, &inference_bytes)) return NERF_STATUS_OVERFLOW;
-        if (ctx->arena_alignment_bytes > 1u) {
-            if (cursor > std::numeric_limits<std::uint64_t>::max() - (ctx->arena_alignment_bytes - 1u)) return NERF_STATUS_OVERFLOW;
-            cursor = cursor + ctx->arena_alignment_bytes - 1u & ~(ctx->arena_alignment_bytes - 1u);
-        }
-        images.offset_bytes = cursor;
-        images.size_bytes   = desc.images_bytes;
-        if (cursor > std::numeric_limits<std::uint64_t>::max() - images.size_bytes) return NERF_STATUS_OVERFLOW;
-        cursor += images.size_bytes;
-        if (ctx->arena_alignment_bytes > 1u) {
-            if (cursor > std::numeric_limits<std::uint64_t>::max() - (ctx->arena_alignment_bytes - 1u)) return NERF_STATUS_OVERFLOW;
-            cursor = cursor + ctx->arena_alignment_bytes - 1u & ~(ctx->arena_alignment_bytes - 1u);
-        }
-        xforms.offset_bytes = cursor;
-        xforms.size_bytes   = desc.cameras_bytes;
-        if (cursor > std::numeric_limits<std::uint64_t>::max() - xforms.size_bytes) return NERF_STATUS_OVERFLOW;
-        cursor += xforms.size_bytes;
-        if (ctx->arena_alignment_bytes > 1u) {
-            if (cursor > std::numeric_limits<std::uint64_t>::max() - (ctx->arena_alignment_bytes - 1u)) return NERF_STATUS_OVERFLOW;
-            cursor = cursor + ctx->arena_alignment_bytes - 1u & ~(ctx->arena_alignment_bytes - 1u);
-        }
-        inference_rgba8.offset_bytes = cursor;
-        inference_rgba8.size_bytes   = inference_bytes;
-        if (cursor > std::numeric_limits<std::uint64_t>::max() - inference_rgba8.size_bytes) return NERF_STATUS_OVERFLOW;
-        cursor += inference_rgba8.size_bytes;
+        if (!reserve_region(&cursor, ctx->arena_alignment_bytes, desc.images_bytes, &images)) return NERF_STATUS_OVERFLOW;
+        if (!reserve_region(&cursor, ctx->arena_alignment_bytes, desc.cameras_bytes, &xforms)) return NERF_STATUS_OVERFLOW;
+        if (!reserve_region(&cursor, ctx->arena_alignment_bytes, inference_bytes, &inference_rgba8)) return NERF_STATUS_OVERFLOW;
     }
     void* scene_ptr                = nullptr;
     const cudaError_t alloc_status = cudaMalloc(&scene_ptr, cursor);
@@ -1935,29 +1942,18 @@ static NerfStatus upload_dataset_from_create_desc(nerf::runtime::ContextStorage*
     ctx->xforms.size_bytes          = xforms.size_bytes;
     ctx->inference_rgba8.ptr        = ctx->scene_device_base + inference_rgba8.offset_bytes;
     ctx->inference_rgba8.size_bytes = inference_rgba8.size_bytes;
+    const auto fail_scene_upload = [&]() -> NerfStatus {
+        const NerfStatus cleanup_status = release_scene_storage(ctx);
+        return cleanup_status == NERF_STATUS_OK ? NERF_STATUS_CUDA_FAILURE : cleanup_status;
+    };
     if (cudaMemcpy(ctx->images.ptr, desc.images_rgba8, ctx->images.size_bytes, cudaMemcpyHostToDevice) != cudaSuccess) {
-        cudaFree(ctx->scene_device_base);
-        ctx->scene_device_base = nullptr;
-        ctx->images            = {};
-        ctx->xforms            = {};
-        ctx->inference_rgba8   = {};
-        return NERF_STATUS_CUDA_FAILURE;
+        return fail_scene_upload();
     }
     if (cudaMemcpy(ctx->xforms.ptr, desc.cameras_4x4_packed, ctx->xforms.size_bytes, cudaMemcpyHostToDevice) != cudaSuccess) {
-        cudaFree(ctx->scene_device_base);
-        ctx->scene_device_base = nullptr;
-        ctx->images            = {};
-        ctx->xforms            = {};
-        ctx->inference_rgba8   = {};
-        return NERF_STATUS_CUDA_FAILURE;
+        return fail_scene_upload();
     }
     if (cudaMemset(ctx->inference_rgba8.ptr, 0, ctx->inference_rgba8.size_bytes) != cudaSuccess) {
-        cudaFree(ctx->scene_device_base);
-        ctx->scene_device_base = nullptr;
-        ctx->images            = {};
-        ctx->xforms            = {};
-        ctx->inference_rgba8   = {};
-        return NERF_STATUS_CUDA_FAILURE;
+        return fail_scene_upload();
     }
     ctx->dataset_info.image_count  = desc.image_count;
     ctx->dataset_info.image_width  = desc.image_width;
@@ -1985,65 +1981,25 @@ NerfStatus nerf_create_context(const NerfCreateDesc* desc, void** out_context) {
     nerf::runtime::Region occupancy_density{};
     {
         std::uint64_t cell_count = normalized.occupancy_grid_res;
-        if (cell_count > std::numeric_limits<std::uint64_t>::max() / static_cast<std::uint64_t>(normalized.occupancy_grid_res)) return NERF_STATUS_OVERFLOW;
-        cell_count *= static_cast<std::uint64_t>(normalized.occupancy_grid_res);
-        if (cell_count > std::numeric_limits<std::uint64_t>::max() / static_cast<std::uint64_t>(normalized.occupancy_grid_res)) return NERF_STATUS_OVERFLOW;
-        cell_count *= static_cast<std::uint64_t>(normalized.occupancy_grid_res);
+        if (!safe_mul_u64(cell_count, static_cast<std::uint64_t>(normalized.occupancy_grid_res), &cell_count)) return NERF_STATUS_OVERFLOW;
+        if (!safe_mul_u64(cell_count, static_cast<std::uint64_t>(normalized.occupancy_grid_res), &cell_count)) return NERF_STATUS_OVERFLOW;
         const std::uint64_t bitfield_bytes = (cell_count + 31u) / 32u * sizeof(std::uint32_t);
         std::uint64_t density_bytes        = cell_count;
-        if (density_bytes > std::numeric_limits<std::uint64_t>::max() / sizeof(float)) return NERF_STATUS_OVERFLOW;
-        density_bytes *= sizeof(float);
-        if (normalized.arena_alignment_bytes > 1u) {
-            if (cursor > std::numeric_limits<std::uint64_t>::max() - (normalized.arena_alignment_bytes - 1u)) return NERF_STATUS_OVERFLOW;
-            cursor = cursor + normalized.arena_alignment_bytes - 1u & ~(normalized.arena_alignment_bytes - 1u);
-        }
-        occupancy_bitfield.offset_bytes = cursor;
-        occupancy_bitfield.size_bytes   = bitfield_bytes;
-        if (cursor > std::numeric_limits<std::uint64_t>::max() - bitfield_bytes) return NERF_STATUS_OVERFLOW;
-        cursor += bitfield_bytes;
-        if (normalized.arena_alignment_bytes > 1u) {
-            if (cursor > std::numeric_limits<std::uint64_t>::max() - (normalized.arena_alignment_bytes - 1u)) return NERF_STATUS_OVERFLOW;
-            cursor = cursor + normalized.arena_alignment_bytes - 1u & ~(normalized.arena_alignment_bytes - 1u);
-        }
-        occupancy_density.offset_bytes = cursor;
-        occupancy_density.size_bytes   = density_bytes;
-        if (cursor > std::numeric_limits<std::uint64_t>::max() - density_bytes) return NERF_STATUS_OVERFLOW;
-        cursor += density_bytes;
+        if (!safe_mul_u64(density_bytes, sizeof(float), &density_bytes)) return NERF_STATUS_OVERFLOW;
+        if (!reserve_region(&cursor, normalized.arena_alignment_bytes, bitfield_bytes, &occupancy_bitfield)) return NERF_STATUS_OVERFLOW;
+        if (!reserve_region(&cursor, normalized.arena_alignment_bytes, density_bytes, &occupancy_density)) return NERF_STATUS_OVERFLOW;
     }
     nerf::runtime::Region sample_rays{};
     nerf::runtime::Region sample_steps{};
     nerf::runtime::Region sample_batch_state{};
     {
         std::uint64_t sample_ray_bytes = normalized.max_batch_rays;
-        if (sample_ray_bytes > std::numeric_limits<std::uint64_t>::max() / sizeof(nerf::sampler::SampleRay)) return NERF_STATUS_OVERFLOW;
-        sample_ray_bytes *= sizeof(nerf::sampler::SampleRay);
+        if (!safe_mul_u64(sample_ray_bytes, sizeof(nerf::sampler::SampleRay), &sample_ray_bytes)) return NERF_STATUS_OVERFLOW;
         std::uint64_t sample_step_bytes = normalized.max_sample_steps;
-        if (sample_step_bytes > std::numeric_limits<std::uint64_t>::max() / sizeof(nerf::sampler::SampleStep)) return NERF_STATUS_OVERFLOW;
-        sample_step_bytes *= sizeof(nerf::sampler::SampleStep);
-        if (normalized.arena_alignment_bytes > 1u) {
-            if (cursor > std::numeric_limits<std::uint64_t>::max() - (normalized.arena_alignment_bytes - 1u)) return NERF_STATUS_OVERFLOW;
-            cursor = cursor + normalized.arena_alignment_bytes - 1u & ~(normalized.arena_alignment_bytes - 1u);
-        }
-        sample_rays.offset_bytes = cursor;
-        sample_rays.size_bytes   = sample_ray_bytes;
-        if (cursor > std::numeric_limits<std::uint64_t>::max() - sample_ray_bytes) return NERF_STATUS_OVERFLOW;
-        cursor += sample_ray_bytes;
-        if (normalized.arena_alignment_bytes > 1u) {
-            if (cursor > std::numeric_limits<std::uint64_t>::max() - (normalized.arena_alignment_bytes - 1u)) return NERF_STATUS_OVERFLOW;
-            cursor = cursor + normalized.arena_alignment_bytes - 1u & ~(normalized.arena_alignment_bytes - 1u);
-        }
-        sample_steps.offset_bytes = cursor;
-        sample_steps.size_bytes   = sample_step_bytes;
-        if (cursor > std::numeric_limits<std::uint64_t>::max() - sample_step_bytes) return NERF_STATUS_OVERFLOW;
-        cursor += sample_step_bytes;
-        if (normalized.arena_alignment_bytes > 1u) {
-            if (cursor > std::numeric_limits<std::uint64_t>::max() - (normalized.arena_alignment_bytes - 1u)) return NERF_STATUS_OVERFLOW;
-            cursor = cursor + normalized.arena_alignment_bytes - 1u & ~(normalized.arena_alignment_bytes - 1u);
-        }
-        sample_batch_state.offset_bytes = cursor;
-        sample_batch_state.size_bytes   = sizeof(nerf::sampler::SampleBatchState);
-        if (cursor > std::numeric_limits<std::uint64_t>::max() - sample_batch_state.size_bytes) return NERF_STATUS_OVERFLOW;
-        cursor += sample_batch_state.size_bytes;
+        if (!safe_mul_u64(sample_step_bytes, sizeof(nerf::sampler::SampleStep), &sample_step_bytes)) return NERF_STATUS_OVERFLOW;
+        if (!reserve_region(&cursor, normalized.arena_alignment_bytes, sample_ray_bytes, &sample_rays)) return NERF_STATUS_OVERFLOW;
+        if (!reserve_region(&cursor, normalized.arena_alignment_bytes, sample_step_bytes, &sample_steps)) return NERF_STATUS_OVERFLOW;
+        if (!reserve_region(&cursor, normalized.arena_alignment_bytes, sizeof(nerf::sampler::SampleBatchState), &sample_batch_state)) return NERF_STATUS_OVERFLOW;
     }
     std::unique_ptr<nerf::runtime::DeviceContext> cuda_context = std::make_unique<nerf::runtime::DeviceContext>();
     std::unique_ptr<nerf::runtime::ContextStorage> context     = std::make_unique<nerf::runtime::ContextStorage>();
@@ -2399,14 +2355,14 @@ NerfStatus nerf_save_network_weights(void* context, const NerfCheckpointFileDesc
     nlohmann::json header  = nlohmann::json::object();
     header["__metadata__"] = {
         {"format", "nerf/network-v1"},
-        {"density_input_dim", std::to_string(layout.density_input_width)},
-        {"density_hidden_layers", std::to_string(layout.density_hidden_layers)},
-        {"density_width", std::to_string(layout.density_width)},
-        {"density_output_dim", std::to_string(layout.density_output_width)},
-        {"color_input_dim", std::to_string(layout.color_input_width)},
-        {"color_hidden_layers", std::to_string(layout.color_hidden_layers)},
-        {"color_width", std::to_string(layout.color_width)},
-        {"color_output_dim", std::to_string(layout.color_output_width)},
+        {"density_input_dim", layout.density_input_width},
+        {"density_hidden_layers", layout.density_hidden_layers},
+        {"density_width", layout.density_width},
+        {"density_output_dim", layout.density_output_width},
+        {"color_input_dim", layout.color_input_width},
+        {"color_hidden_layers", layout.color_hidden_layers},
+        {"color_width", layout.color_width},
+        {"color_output_dim", layout.color_output_width},
     };
     std::uint64_t data_offset = 0u;
     for (std::uint32_t index = 0u; index < layout.tensor_count; ++index) {
@@ -2475,15 +2431,18 @@ NerfStatus nerf_load_network_weights(void* context, const NerfCheckpointFileDesc
     if (!header["__metadata__"].is_object()) return NERF_STATUS_CHECKPOINT_MISMATCH;
     const nlohmann::json& metadata = header["__metadata__"];
     if (metadata.size() != 9u) return NERF_STATUS_CHECKPOINT_MISMATCH;
+    const auto match_metadata_u32 = [&](const char* key, const std::uint32_t expected) -> bool {
+        return metadata.contains(key) && metadata[key].is_number_unsigned() && metadata[key].get<std::uint32_t>() == expected;
+    };
     if (!metadata.contains("format") || metadata["format"] != "nerf/network-v1") return NERF_STATUS_CHECKPOINT_MISMATCH;
-    if (!metadata.contains("density_input_dim") || metadata["density_input_dim"] != std::to_string(layout.density_input_width)) return NERF_STATUS_CHECKPOINT_MISMATCH;
-    if (!metadata.contains("density_hidden_layers") || metadata["density_hidden_layers"] != std::to_string(layout.density_hidden_layers)) return NERF_STATUS_CHECKPOINT_MISMATCH;
-    if (!metadata.contains("density_width") || metadata["density_width"] != std::to_string(layout.density_width)) return NERF_STATUS_CHECKPOINT_MISMATCH;
-    if (!metadata.contains("density_output_dim") || metadata["density_output_dim"] != std::to_string(layout.density_output_width)) return NERF_STATUS_CHECKPOINT_MISMATCH;
-    if (!metadata.contains("color_input_dim") || metadata["color_input_dim"] != std::to_string(layout.color_input_width)) return NERF_STATUS_CHECKPOINT_MISMATCH;
-    if (!metadata.contains("color_hidden_layers") || metadata["color_hidden_layers"] != std::to_string(layout.color_hidden_layers)) return NERF_STATUS_CHECKPOINT_MISMATCH;
-    if (!metadata.contains("color_width") || metadata["color_width"] != std::to_string(layout.color_width)) return NERF_STATUS_CHECKPOINT_MISMATCH;
-    if (!metadata.contains("color_output_dim") || metadata["color_output_dim"] != std::to_string(layout.color_output_width)) return NERF_STATUS_CHECKPOINT_MISMATCH;
+    if (!match_metadata_u32("density_input_dim", layout.density_input_width)) return NERF_STATUS_CHECKPOINT_MISMATCH;
+    if (!match_metadata_u32("density_hidden_layers", layout.density_hidden_layers)) return NERF_STATUS_CHECKPOINT_MISMATCH;
+    if (!match_metadata_u32("density_width", layout.density_width)) return NERF_STATUS_CHECKPOINT_MISMATCH;
+    if (!match_metadata_u32("density_output_dim", layout.density_output_width)) return NERF_STATUS_CHECKPOINT_MISMATCH;
+    if (!match_metadata_u32("color_input_dim", layout.color_input_width)) return NERF_STATUS_CHECKPOINT_MISMATCH;
+    if (!match_metadata_u32("color_hidden_layers", layout.color_hidden_layers)) return NERF_STATUS_CHECKPOINT_MISMATCH;
+    if (!match_metadata_u32("color_width", layout.color_width)) return NERF_STATUS_CHECKPOINT_MISMATCH;
+    if (!match_metadata_u32("color_output_dim", layout.color_output_width)) return NERF_STATUS_CHECKPOINT_MISMATCH;
     const std::uint64_t data_base = sizeof(std::uint64_t) + header_size;
     std::uint64_t expected_offset = 0u;
     std::uint64_t density_count   = 0u;
