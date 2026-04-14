@@ -18,6 +18,8 @@
 
 #include "json/json.hpp"
 
+static_assert(std::endian::native == std::endian::little);
+
 constexpr std::uint32_t kMaxSampleStepsPerRay          = 256u;
 constexpr std::uint32_t kPosFreqs                      = 10u;
 constexpr std::uint32_t kDirFreqs                      = 4u;
@@ -239,142 +241,6 @@ namespace nerf::network {
         std::uint32_t color_output_width    = 0u;
     };
 } // namespace nerf::network
-
-
-namespace nerf::io {
-    static_assert(std::endian::native == std::endian::little);
-    NerfStatus save_network_checkpoint_file(const NerfCheckpointFileDesc& desc, const nerf::network::NetworkCheckpointLayout& layout, const nerf::host::HostCheckpointData& data) {
-        if (!desc.path_utf8) return NERF_STATUS_INVALID_ARGUMENT;
-        if (layout.tensor_count == 0u) return NERF_STATUS_CHECKPOINT_MISMATCH;
-        if (data.density_params_f32.size() != layout.density_param_count) return NERF_STATUS_CHECKPOINT_MISMATCH;
-        if (data.color_params_f32.size() != layout.color_param_count) return NERF_STATUS_CHECKPOINT_MISMATCH;
-        std::ofstream file(desc.path_utf8, std::ios::binary | std::ios::trunc);
-        if (!file) return NERF_STATUS_INTERNAL_ERROR;
-        nlohmann::json header  = nlohmann::json::object();
-        header["__metadata__"] = {
-            {"format", "nerf/network-v1"},
-            {"density_input_dim", std::to_string(layout.density_input_width)},
-            {"density_hidden_layers", std::to_string(layout.density_hidden_layers)},
-            {"density_width", std::to_string(layout.density_width)},
-            {"density_output_dim", std::to_string(layout.density_output_width)},
-            {"color_input_dim", std::to_string(layout.color_input_width)},
-            {"color_hidden_layers", std::to_string(layout.color_hidden_layers)},
-            {"color_width", std::to_string(layout.color_width)},
-            {"color_output_dim", std::to_string(layout.color_output_width)},
-        };
-        std::uint64_t data_offset = 0u;
-        for (std::uint32_t index = 0u; index < layout.tensor_count; ++index) {
-            const nerf::network::NetworkCheckpointTensorLayout& tensor = layout.tensors[index];
-            const std::uint64_t element_count                          = static_cast<std::uint64_t>(tensor.rows) * tensor.cols;
-            const std::uint64_t begin                                  = data_offset;
-            const std::uint64_t end                                    = begin + element_count * sizeof(float);
-            header[std::string{tensor.name}]                           = {
-                {"dtype", "F32"},
-                {"shape", {tensor.rows, tensor.cols}},
-                {"data_offsets", {begin, end}},
-            };
-            data_offset = end;
-        }
-        const std::string header_bytes  = header.dump();
-        const std::uint64_t header_size = header_bytes.size();
-        file.write(reinterpret_cast<const char*>(&header_size), sizeof(header_size));
-        file.write(header_bytes.data(), static_cast<std::streamsize>(header_bytes.size()));
-        if (!file) return NERF_STATUS_INTERNAL_ERROR;
-        for (std::uint32_t index = 0u; index < layout.tensor_count; ++index) {
-            const nerf::network::NetworkCheckpointTensorLayout& tensor = layout.tensors[index];
-            const float* src                                           = tensor.network_index == 0u ? data.density_params_f32.data() + tensor.offset : data.color_params_f32.data() + tensor.offset;
-            const std::uint64_t element_count                          = static_cast<std::uint64_t>(tensor.rows) * tensor.cols;
-            file.write(reinterpret_cast<const char*>(src), static_cast<std::streamsize>(element_count * sizeof(float)));
-            if (!file) return NERF_STATUS_INTERNAL_ERROR;
-        }
-        if (!file.good()) return NERF_STATUS_INTERNAL_ERROR;
-        return NERF_STATUS_OK;
-    }
-    NerfStatus load_network_checkpoint_file(const NerfCheckpointFileDesc& desc, const nerf::network::NetworkCheckpointLayout& layout, nerf::host::HostCheckpointData& data) {
-        if (!desc.path_utf8) return NERF_STATUS_INVALID_ARGUMENT;
-        if (layout.tensor_count == 0u) return NERF_STATUS_CHECKPOINT_MISMATCH;
-        std::ifstream file(desc.path_utf8, std::ios::binary);
-        if (!file) return NERF_STATUS_CHECKPOINT_INVALID;
-        file.seekg(0, std::ios::end);
-        const std::uint64_t file_size = file.tellg();
-        file.seekg(0, std::ios::beg);
-        if (file_size < sizeof(std::uint64_t)) return NERF_STATUS_CHECKPOINT_INVALID;
-        std::uint64_t header_size = 0u;
-        file.read(reinterpret_cast<char*>(&header_size), sizeof(header_size));
-        if (!file) return NERF_STATUS_CHECKPOINT_INVALID;
-        if (header_size == 0u || header_size > file_size - sizeof(std::uint64_t)) return NERF_STATUS_CHECKPOINT_INVALID;
-        std::string header_bytes(header_size, '\0');
-        file.read(header_bytes.data(), static_cast<std::streamsize>(header_bytes.size()));
-        if (!file) return NERF_STATUS_CHECKPOINT_INVALID;
-        nlohmann::json header = nlohmann::json::object();
-        try {
-            header = nlohmann::json::parse(header_bytes);
-        } catch (...) {
-            return NERF_STATUS_CHECKPOINT_INVALID;
-        }
-        if (!header.is_object()) return NERF_STATUS_CHECKPOINT_INVALID;
-        if (header.size() != static_cast<std::size_t>(layout.tensor_count) + 1u) return NERF_STATUS_CHECKPOINT_MISMATCH;
-        if (!header.contains("__metadata__")) return NERF_STATUS_CHECKPOINT_MISMATCH;
-        if (!header["__metadata__"].is_object()) return NERF_STATUS_CHECKPOINT_MISMATCH;
-        const nlohmann::json& metadata = header["__metadata__"];
-        if (metadata.size() != 9u) return NERF_STATUS_CHECKPOINT_MISMATCH;
-        if (!metadata.contains("format") || metadata["format"] != "nerf/network-v1") return NERF_STATUS_CHECKPOINT_MISMATCH;
-        if (!metadata.contains("density_input_dim") || metadata["density_input_dim"] != std::to_string(layout.density_input_width)) return NERF_STATUS_CHECKPOINT_MISMATCH;
-        if (!metadata.contains("density_hidden_layers") || metadata["density_hidden_layers"] != std::to_string(layout.density_hidden_layers)) return NERF_STATUS_CHECKPOINT_MISMATCH;
-        if (!metadata.contains("density_width") || metadata["density_width"] != std::to_string(layout.density_width)) return NERF_STATUS_CHECKPOINT_MISMATCH;
-        if (!metadata.contains("density_output_dim") || metadata["density_output_dim"] != std::to_string(layout.density_output_width)) return NERF_STATUS_CHECKPOINT_MISMATCH;
-        if (!metadata.contains("color_input_dim") || metadata["color_input_dim"] != std::to_string(layout.color_input_width)) return NERF_STATUS_CHECKPOINT_MISMATCH;
-        if (!metadata.contains("color_hidden_layers") || metadata["color_hidden_layers"] != std::to_string(layout.color_hidden_layers)) return NERF_STATUS_CHECKPOINT_MISMATCH;
-        if (!metadata.contains("color_width") || metadata["color_width"] != std::to_string(layout.color_width)) return NERF_STATUS_CHECKPOINT_MISMATCH;
-        if (!metadata.contains("color_output_dim") || metadata["color_output_dim"] != std::to_string(layout.color_output_width)) return NERF_STATUS_CHECKPOINT_MISMATCH;
-        const std::uint64_t data_base = sizeof(std::uint64_t) + header_size;
-        std::uint64_t expected_offset = 0u;
-        std::uint64_t density_count   = 0u;
-        std::uint64_t color_count     = 0u;
-        for (std::uint32_t index = 0u; index < layout.tensor_count; ++index) {
-            const nerf::network::NetworkCheckpointTensorLayout& tensor_layout = layout.tensors[index];
-            if (!header.contains(std::string{tensor_layout.name})) return NERF_STATUS_CHECKPOINT_MISMATCH;
-            const nlohmann::json& tensor = header[std::string{tensor_layout.name}];
-            if (!tensor.is_object()) return NERF_STATUS_CHECKPOINT_MISMATCH;
-            if (!tensor.contains("dtype") || tensor["dtype"] != "F32") return NERF_STATUS_CHECKPOINT_MISMATCH;
-            if (!tensor.contains("shape") || !tensor["shape"].is_array() || tensor["shape"].size() != 2u) return NERF_STATUS_CHECKPOINT_MISMATCH;
-            if (!tensor.contains("data_offsets") || !tensor["data_offsets"].is_array() || tensor["data_offsets"].size() != 2u) return NERF_STATUS_CHECKPOINT_MISMATCH;
-            const std::uint64_t rows = tensor["shape"][0].get<std::uint64_t>();
-            const std::uint64_t cols = tensor["shape"][1].get<std::uint64_t>();
-            if (rows != tensor_layout.rows || cols != tensor_layout.cols) return NERF_STATUS_CHECKPOINT_MISMATCH;
-            const std::uint64_t begin = tensor["data_offsets"][0].get<std::uint64_t>();
-            const std::uint64_t end   = tensor["data_offsets"][1].get<std::uint64_t>();
-            const std::uint64_t bytes = rows * cols * sizeof(float);
-            if (begin != expected_offset || end != begin + bytes) return NERF_STATUS_CHECKPOINT_MISMATCH;
-            if (data_base + end > file_size) return NERF_STATUS_CHECKPOINT_INVALID;
-            expected_offset = end;
-            if (tensor_layout.network_index == 0u)
-                density_count += rows * cols;
-            else
-                color_count += rows * cols;
-        }
-        if (data_base + expected_offset != file_size) return NERF_STATUS_CHECKPOINT_INVALID;
-        if (density_count != layout.density_param_count) return NERF_STATUS_CHECKPOINT_MISMATCH;
-        if (color_count != layout.color_param_count) return NERF_STATUS_CHECKPOINT_MISMATCH;
-        data.density_params_f32.resize(density_count);
-        data.color_params_f32.resize(color_count);
-        for (std::uint32_t index = 0u; index < layout.tensor_count; ++index) {
-            const nerf::network::NetworkCheckpointTensorLayout& tensor_layout = layout.tensors[index];
-            const nlohmann::json& tensor                                      = header[std::string{tensor_layout.name}];
-            const std::uint64_t rows                                          = tensor["shape"][0].get<std::uint64_t>();
-            const std::uint64_t cols                                          = tensor["shape"][1].get<std::uint64_t>();
-            const std::uint64_t begin                                         = tensor["data_offsets"][0].get<std::uint64_t>();
-            const std::uint64_t elements                                      = rows * cols;
-            file.seekg(static_cast<std::streamoff>(data_base + begin), std::ios::beg);
-            if (tensor_layout.network_index == 0u)
-                file.read(reinterpret_cast<char*>(data.density_params_f32.data() + tensor_layout.offset), static_cast<std::streamsize>(elements * sizeof(float)));
-            else
-                file.read(reinterpret_cast<char*>(data.color_params_f32.data() + tensor_layout.offset), static_cast<std::streamsize>(elements * sizeof(float)));
-            if (!file) return NERF_STATUS_CHECKPOINT_INVALID;
-        }
-        return NERF_STATUS_OK;
-    }
-} // namespace nerf::io
 
 
 namespace nerf::encoder {
@@ -2531,6 +2397,9 @@ NerfStatus nerf_save_network_weights(void* context, const NerfCheckpointFileDesc
     }
     nerf::network::NetworkCheckpointLayout layout{};
     if (!nerf::network::describe_network_checkpoint_layout(runtime->network, layout)) return NERF_STATUS_INTERNAL_ERROR;
+    if (layout.tensor_count == 0u) return NERF_STATUS_CHECKPOINT_MISMATCH;
+    if (runtime->network.density.params_f32.count != layout.density_param_count) return NERF_STATUS_CHECKPOINT_MISMATCH;
+    if (runtime->network.color.params_f32.count != layout.color_param_count) return NERF_STATUS_CHECKPOINT_MISMATCH;
     std::scoped_lock run_lock(runtime->run_mutex);
     if (cudaStreamSynchronize(runtime->stream) != cudaSuccess) return NERF_STATUS_CUDA_FAILURE;
     nerf::host::HostCheckpointData checkpoint{};
@@ -2538,7 +2407,47 @@ NerfStatus nerf_save_network_weights(void* context, const NerfCheckpointFileDesc
     checkpoint.color_params_f32.resize(runtime->network.color.params_f32.count);
     if (cudaMemcpy(checkpoint.density_params_f32.data(), runtime->network.density.params_f32.ptr, runtime->network.density.params_f32.bytes, cudaMemcpyDeviceToHost) != cudaSuccess) return NERF_STATUS_CUDA_FAILURE;
     if (cudaMemcpy(checkpoint.color_params_f32.data(), runtime->network.color.params_f32.ptr, runtime->network.color.params_f32.bytes, cudaMemcpyDeviceToHost) != cudaSuccess) return NERF_STATUS_CUDA_FAILURE;
-    return nerf::io::save_network_checkpoint_file(*desc, layout, checkpoint);
+    std::ofstream file(desc->path_utf8, std::ios::binary | std::ios::trunc);
+    if (!file) return NERF_STATUS_INTERNAL_ERROR;
+    nlohmann::json header  = nlohmann::json::object();
+    header["__metadata__"] = {
+        {"format", "nerf/network-v1"},
+        {"density_input_dim", std::to_string(layout.density_input_width)},
+        {"density_hidden_layers", std::to_string(layout.density_hidden_layers)},
+        {"density_width", std::to_string(layout.density_width)},
+        {"density_output_dim", std::to_string(layout.density_output_width)},
+        {"color_input_dim", std::to_string(layout.color_input_width)},
+        {"color_hidden_layers", std::to_string(layout.color_hidden_layers)},
+        {"color_width", std::to_string(layout.color_width)},
+        {"color_output_dim", std::to_string(layout.color_output_width)},
+    };
+    std::uint64_t data_offset = 0u;
+    for (std::uint32_t index = 0u; index < layout.tensor_count; ++index) {
+        const nerf::network::NetworkCheckpointTensorLayout& tensor = layout.tensors[index];
+        const std::uint64_t element_count                          = static_cast<std::uint64_t>(tensor.rows) * tensor.cols;
+        const std::uint64_t begin                                  = data_offset;
+        const std::uint64_t end                                    = begin + element_count * sizeof(float);
+        header[std::string{tensor.name}]                           = {
+            {"dtype", "F32"},
+            {"shape", {tensor.rows, tensor.cols}},
+            {"data_offsets", {begin, end}},
+        };
+        data_offset = end;
+    }
+    const std::string header_bytes  = header.dump();
+    const std::uint64_t header_size = header_bytes.size();
+    file.write(reinterpret_cast<const char*>(&header_size), sizeof(header_size));
+    file.write(header_bytes.data(), static_cast<std::streamsize>(header_bytes.size()));
+    if (!file) return NERF_STATUS_INTERNAL_ERROR;
+    for (std::uint32_t index = 0u; index < layout.tensor_count; ++index) {
+        const nerf::network::NetworkCheckpointTensorLayout& tensor = layout.tensors[index];
+        const float* src                                           = tensor.network_index == 0u ? checkpoint.density_params_f32.data() + tensor.offset : checkpoint.color_params_f32.data() + tensor.offset;
+        const std::uint64_t element_count                          = static_cast<std::uint64_t>(tensor.rows) * tensor.cols;
+        file.write(reinterpret_cast<const char*>(src), static_cast<std::streamsize>(element_count * sizeof(float)));
+        if (!file) return NERF_STATUS_INTERNAL_ERROR;
+    }
+    if (!file.good()) return NERF_STATUS_INTERNAL_ERROR;
+    return NERF_STATUS_OK;
 }
 NerfStatus nerf_load_network_weights(void* context, const NerfCheckpointFileDesc* desc) {
     if (!context || !desc || !desc->path_utf8) return NERF_STATUS_INVALID_ARGUMENT;
@@ -2551,8 +2460,90 @@ NerfStatus nerf_load_network_weights(void* context, const NerfCheckpointFileDesc
     nerf::network::NetworkCheckpointLayout layout{};
     if (!nerf::network::describe_network_checkpoint_layout(runtime->network, layout)) return NERF_STATUS_INTERNAL_ERROR;
     nerf::host::HostCheckpointData checkpoint{};
-    const NerfStatus load_status = nerf::io::load_network_checkpoint_file(*desc, layout, checkpoint);
-    if (load_status != NERF_STATUS_OK) return load_status;
+    if (layout.tensor_count == 0u) return NERF_STATUS_CHECKPOINT_MISMATCH;
+    std::ifstream file(desc->path_utf8, std::ios::binary);
+    if (!file) return NERF_STATUS_CHECKPOINT_INVALID;
+    file.seekg(0, std::ios::end);
+    const std::streampos file_end = file.tellg();
+    if (file_end < 0) return NERF_STATUS_CHECKPOINT_INVALID;
+    const std::uint64_t file_size = static_cast<std::uint64_t>(file_end);
+    file.seekg(0, std::ios::beg);
+    if (file_size < sizeof(std::uint64_t)) return NERF_STATUS_CHECKPOINT_INVALID;
+    std::uint64_t header_size = 0u;
+    file.read(reinterpret_cast<char*>(&header_size), sizeof(header_size));
+    if (!file) return NERF_STATUS_CHECKPOINT_INVALID;
+    if (header_size == 0u || header_size > file_size - sizeof(std::uint64_t)) return NERF_STATUS_CHECKPOINT_INVALID;
+    std::string header_bytes(header_size, '\0');
+    file.read(header_bytes.data(), static_cast<std::streamsize>(header_bytes.size()));
+    if (!file) return NERF_STATUS_CHECKPOINT_INVALID;
+    nlohmann::json header = nlohmann::json::object();
+    try {
+        header = nlohmann::json::parse(header_bytes);
+    } catch (...) {
+        return NERF_STATUS_CHECKPOINT_INVALID;
+    }
+    if (!header.is_object()) return NERF_STATUS_CHECKPOINT_INVALID;
+    if (header.size() != static_cast<std::size_t>(layout.tensor_count) + 1u) return NERF_STATUS_CHECKPOINT_MISMATCH;
+    if (!header.contains("__metadata__")) return NERF_STATUS_CHECKPOINT_MISMATCH;
+    if (!header["__metadata__"].is_object()) return NERF_STATUS_CHECKPOINT_MISMATCH;
+    const nlohmann::json& metadata = header["__metadata__"];
+    if (metadata.size() != 9u) return NERF_STATUS_CHECKPOINT_MISMATCH;
+    if (!metadata.contains("format") || metadata["format"] != "nerf/network-v1") return NERF_STATUS_CHECKPOINT_MISMATCH;
+    if (!metadata.contains("density_input_dim") || metadata["density_input_dim"] != std::to_string(layout.density_input_width)) return NERF_STATUS_CHECKPOINT_MISMATCH;
+    if (!metadata.contains("density_hidden_layers") || metadata["density_hidden_layers"] != std::to_string(layout.density_hidden_layers)) return NERF_STATUS_CHECKPOINT_MISMATCH;
+    if (!metadata.contains("density_width") || metadata["density_width"] != std::to_string(layout.density_width)) return NERF_STATUS_CHECKPOINT_MISMATCH;
+    if (!metadata.contains("density_output_dim") || metadata["density_output_dim"] != std::to_string(layout.density_output_width)) return NERF_STATUS_CHECKPOINT_MISMATCH;
+    if (!metadata.contains("color_input_dim") || metadata["color_input_dim"] != std::to_string(layout.color_input_width)) return NERF_STATUS_CHECKPOINT_MISMATCH;
+    if (!metadata.contains("color_hidden_layers") || metadata["color_hidden_layers"] != std::to_string(layout.color_hidden_layers)) return NERF_STATUS_CHECKPOINT_MISMATCH;
+    if (!metadata.contains("color_width") || metadata["color_width"] != std::to_string(layout.color_width)) return NERF_STATUS_CHECKPOINT_MISMATCH;
+    if (!metadata.contains("color_output_dim") || metadata["color_output_dim"] != std::to_string(layout.color_output_width)) return NERF_STATUS_CHECKPOINT_MISMATCH;
+    const std::uint64_t data_base = sizeof(std::uint64_t) + header_size;
+    std::uint64_t expected_offset = 0u;
+    std::uint64_t density_count   = 0u;
+    std::uint64_t color_count     = 0u;
+    for (std::uint32_t index = 0u; index < layout.tensor_count; ++index) {
+        const nerf::network::NetworkCheckpointTensorLayout& tensor_layout = layout.tensors[index];
+        const std::string tensor_name{tensor_layout.name};
+        if (!header.contains(tensor_name)) return NERF_STATUS_CHECKPOINT_MISMATCH;
+        const nlohmann::json& tensor = header[tensor_name];
+        if (!tensor.is_object()) return NERF_STATUS_CHECKPOINT_MISMATCH;
+        if (!tensor.contains("dtype") || tensor["dtype"] != "F32") return NERF_STATUS_CHECKPOINT_MISMATCH;
+        if (!tensor.contains("shape") || !tensor["shape"].is_array() || tensor["shape"].size() != 2u) return NERF_STATUS_CHECKPOINT_MISMATCH;
+        if (!tensor.contains("data_offsets") || !tensor["data_offsets"].is_array() || tensor["data_offsets"].size() != 2u) return NERF_STATUS_CHECKPOINT_MISMATCH;
+        const std::uint64_t rows = tensor["shape"][0].get<std::uint64_t>();
+        const std::uint64_t cols = tensor["shape"][1].get<std::uint64_t>();
+        if (rows != tensor_layout.rows || cols != tensor_layout.cols) return NERF_STATUS_CHECKPOINT_MISMATCH;
+        const std::uint64_t begin = tensor["data_offsets"][0].get<std::uint64_t>();
+        const std::uint64_t end   = tensor["data_offsets"][1].get<std::uint64_t>();
+        const std::uint64_t bytes = rows * cols * sizeof(float);
+        if (begin != expected_offset || end != begin + bytes) return NERF_STATUS_CHECKPOINT_MISMATCH;
+        if (data_base > file_size || end > file_size - data_base) return NERF_STATUS_CHECKPOINT_INVALID;
+        expected_offset = end;
+        if (tensor_layout.network_index == 0u)
+            density_count += rows * cols;
+        else
+            color_count += rows * cols;
+    }
+    if (data_base > file_size || expected_offset != file_size - data_base) return NERF_STATUS_CHECKPOINT_INVALID;
+    if (density_count != layout.density_param_count) return NERF_STATUS_CHECKPOINT_MISMATCH;
+    if (color_count != layout.color_param_count) return NERF_STATUS_CHECKPOINT_MISMATCH;
+    checkpoint.density_params_f32.resize(density_count);
+    checkpoint.color_params_f32.resize(color_count);
+    for (std::uint32_t index = 0u; index < layout.tensor_count; ++index) {
+        const nerf::network::NetworkCheckpointTensorLayout& tensor_layout = layout.tensors[index];
+        const std::string tensor_name{tensor_layout.name};
+        const nlohmann::json& tensor = header[tensor_name];
+        const std::uint64_t rows     = tensor["shape"][0].get<std::uint64_t>();
+        const std::uint64_t cols     = tensor["shape"][1].get<std::uint64_t>();
+        const std::uint64_t begin    = tensor["data_offsets"][0].get<std::uint64_t>();
+        const std::uint64_t elements = rows * cols;
+        file.seekg(static_cast<std::streamoff>(data_base + begin), std::ios::beg);
+        if (tensor_layout.network_index == 0u)
+            file.read(reinterpret_cast<char*>(checkpoint.density_params_f32.data() + tensor_layout.offset), static_cast<std::streamsize>(elements * sizeof(float)));
+        else
+            file.read(reinterpret_cast<char*>(checkpoint.color_params_f32.data() + tensor_layout.offset), static_cast<std::streamsize>(elements * sizeof(float)));
+        if (!file) return NERF_STATUS_CHECKPOINT_INVALID;
+    }
     if (checkpoint.density_params_f32.size() != runtime->network.density.params_f32.count) return NERF_STATUS_CHECKPOINT_MISMATCH;
     if (checkpoint.color_params_f32.size() != runtime->network.color.params_f32.count) return NERF_STATUS_CHECKPOINT_MISMATCH;
     std::scoped_lock run_lock(runtime->run_mutex);
