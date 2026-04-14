@@ -39,21 +39,6 @@ struct CoordBasis {
     CoordAxis z;
 };
 
-static bool parse_u32(std::string_view value, std::uint32_t& out) {
-    std::uint64_t parsed = 0u;
-    const auto [ptr, ec] = std::from_chars(value.data(), value.data() + value.size(), parsed);
-    if (ec != std::errc{} || ptr != value.data() + value.size() || parsed > std::numeric_limits<std::uint32_t>::max()) return false;
-    out = static_cast<std::uint32_t>(parsed);
-    return true;
-}
-
-static bool safe_mul_u64(const std::uint64_t a, const std::uint64_t b, std::uint64_t* out) {
-    if (!out) return false;
-    if (a != 0u && b > std::numeric_limits<std::uint64_t>::max() / a) return false;
-    *out = a * b;
-    return true;
-}
-
 struct InferenceMetrics {
     double psnr      = 0.0;
     double pred_luma = 0.0;
@@ -107,63 +92,57 @@ static bool write_rgba_png(const std::filesystem::path& path, const std::uint32_
 }
 
 static NerfStatus resolve_dataset_json_path(const char* path_utf8, std::filesystem::path& out_json_path) {
-    if (!path_utf8) return NERF_STATUS_INVALID_ARGUMENT;
+    if (!path_utf8) return NERF_STATUS_INVALID_USAGE;
     std::filesystem::path root{path_utf8};
     std::filesystem::path json_path = root;
     if (!json_path.has_extension() || json_path.extension() != ".json") json_path = root / "transforms_train.json";
     std::error_code ec{};
     json_path = std::filesystem::absolute(json_path, ec);
-    if (ec) return NERF_STATUS_INTERNAL_ERROR;
+    if (ec) return NERF_STATUS_FAILURE;
     json_path = std::filesystem::weakly_canonical(json_path, ec);
-    if (ec) return NERF_STATUS_INTERNAL_ERROR;
+    if (ec) return NERF_STATUS_FAILURE;
     out_json_path = std::move(json_path);
     return NERF_STATUS_OK;
 }
 
-static bool axis_to_basis_entry(const CoordAxis axis, std::uint32_t* out_axis, float* out_sign) {
-    if (!out_axis || !out_sign) return false;
+static void axis_to_basis_entry(const CoordAxis axis, std::uint32_t& out_axis, float& out_sign) {
     switch (axis) {
     case CoordAxis::PosX:
-        *out_axis = 0u;
-        *out_sign = 1.0f;
-        return true;
+        out_axis = 0u;
+        out_sign = 1.0f;
+        return;
     case CoordAxis::NegX:
-        *out_axis = 0u;
-        *out_sign = -1.0f;
-        return true;
+        out_axis = 0u;
+        out_sign = -1.0f;
+        return;
     case CoordAxis::PosY:
-        *out_axis = 1u;
-        *out_sign = 1.0f;
-        return true;
+        out_axis = 1u;
+        out_sign = 1.0f;
+        return;
     case CoordAxis::NegY:
-        *out_axis = 1u;
-        *out_sign = -1.0f;
-        return true;
+        out_axis = 1u;
+        out_sign = -1.0f;
+        return;
     case CoordAxis::PosZ:
-        *out_axis = 2u;
-        *out_sign = 1.0f;
-        return true;
+        out_axis = 2u;
+        out_sign = 1.0f;
+        return;
     case CoordAxis::NegZ:
-        *out_axis = 2u;
-        *out_sign = -1.0f;
-        return true;
+        out_axis = 2u;
+        out_sign = -1.0f;
+        return;
     }
-    return false;
 }
 
-static NerfStatus fill_basis_matrix(const CoordBasis& basis, float out_matrix[9]) {
+static void fill_basis_matrix(const CoordBasis& basis, float out_matrix[9]) {
     std::fill_n(out_matrix, 9, 0.0f);
     const CoordAxis dirs[3] = {basis.x, basis.y, basis.z};
-    std::uint32_t seen_axes = 0u;
     for (std::size_t c = 0u; c < 3u; ++c) {
         std::uint32_t axis = 0u;
         float sign         = 0.0f;
-        if (!axis_to_basis_entry(dirs[c], &axis, &sign)) return NERF_STATUS_INVALID_ARGUMENT;
-        if ((seen_axes & (1u << axis)) != 0u) return NERF_STATUS_INVALID_ARGUMENT;
-        seen_axes |= (1u << axis);
+        axis_to_basis_entry(dirs[c], axis, sign);
         out_matrix[axis * 3u + c] = sign;
     }
-    return seen_axes == 0x7u ? NERF_STATUS_OK : NERF_STATUS_INVALID_ARGUMENT;
 }
 
 static NerfStatus load_nerf_synthetic_host_dataset(const char* path_utf8, HostDatasetData& out_data) {
@@ -171,7 +150,7 @@ static NerfStatus load_nerf_synthetic_host_dataset(const char* path_utf8, HostDa
     const CoordBasis src_camera{.x = CoordAxis::PosX, .y = CoordAxis::PosY, .z = CoordAxis::PosZ};
     const CoordBasis dst_world{.x = CoordAxis::PosX, .y = CoordAxis::PosY, .z = CoordAxis::PosZ};
     const CoordBasis dst_camera{.x = CoordAxis::PosX, .y = CoordAxis::PosY, .z = CoordAxis::PosZ};
-    const float translation_scale = 0.33f;
+    const float translation_scale  = 0.33f;
     const float translation_bias_x = 0.5f;
     const float translation_bias_y = 0.5f;
     const float translation_bias_z = 0.5f;
@@ -180,199 +159,147 @@ static NerfStatus load_nerf_synthetic_host_dataset(const char* path_utf8, HostDa
     NerfStatus status = resolve_dataset_json_path(path_utf8, json_path);
     if (status != NERF_STATUS_OK) return status;
 
-    std::ifstream json_file(json_path, std::ios::binary);
-    if (!json_file) return NERF_STATUS_INTERNAL_ERROR;
-
-    nlohmann::json json_value;
     try {
+        std::ifstream json_file(json_path, std::ios::binary);
+        nlohmann::json json_value;
         json_file >> json_value;
-    } catch (...) {
-        return NERF_STATUS_INTERNAL_ERROR;
-    }
 
-    if (!json_value.contains("camera_angle_x") || !json_value.contains("frames")) return NERF_STATUS_INTERNAL_ERROR;
-    if (!json_value.at("frames").is_array() || json_value.at("frames").empty()) return NERF_STATUS_INTERNAL_ERROR;
+        const float camera_angle_x    = json_value.at("camera_angle_x").get<float>();
+        const nlohmann::json& frames  = json_value.at("frames");
+        const std::size_t frame_count = frames.size();
 
-    float camera_angle_x = 0.0f;
-    try {
-        camera_angle_x = json_value.at("camera_angle_x").get<float>();
-    } catch (...) {
-        return NERF_STATUS_INTERNAL_ERROR;
-    }
-    if (!std::isfinite(camera_angle_x)) return NERF_STATUS_INTERNAL_ERROR;
-
-    const nlohmann::json& frames  = json_value.at("frames");
-    const std::size_t frame_count = frames.size();
-    if (frame_count > static_cast<std::size_t>(std::numeric_limits<std::uint32_t>::max())) return NERF_STATUS_OVERFLOW;
-
-    std::vector<std::filesystem::path> image_paths(frame_count);
-    std::vector<float> row_major_4x4(frame_count * 16u, 0.0f);
-    for (std::size_t frame_index = 0u; frame_index < frame_count; ++frame_index) {
-        const nlohmann::json& frame = frames[frame_index];
-        if (!frame.contains("file_path") || !frame.contains("transform_matrix")) return NERF_STATUS_INTERNAL_ERROR;
-
-        try {
+        std::vector<std::filesystem::path> image_paths(frame_count);
+        std::vector<float> row_major_4x4(frame_count * 16u, 0.0f);
+        for (std::size_t frame_index = 0u; frame_index < frame_count; ++frame_index) {
+            const nlohmann::json& frame = frames[frame_index];
             std::filesystem::path image_path = json_path.parent_path() / frame.at("file_path").get<std::string>();
             if (!image_path.has_extension()) image_path.replace_extension(".png");
             std::error_code ec{};
             image_path = std::filesystem::absolute(image_path, ec);
-            if (ec) return NERF_STATUS_INTERNAL_ERROR;
             image_path = std::filesystem::weakly_canonical(image_path, ec);
-            if (ec) return NERF_STATUS_INTERNAL_ERROR;
             image_paths[frame_index] = std::move(image_path);
-        } catch (...) {
-            return NERF_STATUS_INTERNAL_ERROR;
-        }
 
-        try {
             for (std::size_t r = 0u; r < 4u; ++r) {
                 for (std::size_t c = 0u; c < 4u; ++c) {
-                    const float value = frame.at("transform_matrix").at(r).at(c).get<float>();
-                    if (!std::isfinite(value)) return NERF_STATUS_INTERNAL_ERROR;
-                    row_major_4x4[frame_index * 16u + r * 4u + c] = value;
+                    row_major_4x4[frame_index * 16u + r * 4u + c] = frame.at("transform_matrix").at(r).at(c).get<float>();
                 }
             }
-        } catch (...) {
-            return NERF_STATUS_INTERNAL_ERROR;
         }
-    }
 
-    int first_width       = 0;
-    int first_height      = 0;
-    stbi_uc* first_pixels = stbi_load(image_paths[0].string().c_str(), &first_width, &first_height, nullptr, 4);
-    if (!first_pixels || first_width <= 0 || first_height <= 0) {
-        if (first_pixels) stbi_image_free(first_pixels);
-        return NERF_STATUS_INTERNAL_ERROR;
-    }
+        int first_width       = 0;
+        int first_height      = 0;
+        stbi_uc* first_pixels = stbi_load(image_paths[0].string().c_str(), &first_width, &first_height, nullptr, 4);
+        if (!first_pixels) return NERF_STATUS_IO_ERROR;
 
-    std::uint64_t bytes_per_image = static_cast<std::uint64_t>(first_width);
-    if (!safe_mul_u64(bytes_per_image, static_cast<std::uint64_t>(first_height), &bytes_per_image)) {
+        const std::size_t bytes_per_image   = static_cast<std::size_t>(first_width) * static_cast<std::size_t>(first_height) * 4u;
+        const std::size_t total_image_bytes = bytes_per_image * frame_count;
+        std::vector<std::uint8_t> host_images_rgba8(total_image_bytes);
+        std::memcpy(host_images_rgba8.data(), first_pixels, bytes_per_image);
         stbi_image_free(first_pixels);
-        return NERF_STATUS_OVERFLOW;
-    }
-    if (!safe_mul_u64(bytes_per_image, 4u, &bytes_per_image)) {
-        stbi_image_free(first_pixels);
-        return NERF_STATUS_OVERFLOW;
-    }
 
-    std::uint64_t total_image_bytes = bytes_per_image;
-    if (!safe_mul_u64(total_image_bytes, frame_count, &total_image_bytes)) {
-        stbi_image_free(first_pixels);
-        return NERF_STATUS_OVERFLOW;
-    }
-
-    std::vector<std::uint8_t> host_images_rgba8(total_image_bytes);
-    std::memcpy(host_images_rgba8.data(), first_pixels, bytes_per_image);
-    stbi_image_free(first_pixels);
-
-    for (std::size_t image_index = 1u; image_index < frame_count; ++image_index) {
-        int width       = 0;
-        int height      = 0;
-        stbi_uc* pixels = stbi_load(image_paths[image_index].string().c_str(), &width, &height, nullptr, 4);
-        if (!pixels) return NERF_STATUS_INTERNAL_ERROR;
-        if (width != first_width || height != first_height) {
+        for (std::size_t image_index = 1u; image_index < frame_count; ++image_index) {
+            int width       = 0;
+            int height      = 0;
+            stbi_uc* pixels = stbi_load(image_paths[image_index].string().c_str(), &width, &height, nullptr, 4);
+            if (!pixels) return NERF_STATUS_IO_ERROR;
+            std::memcpy(host_images_rgba8.data() + image_index * bytes_per_image, pixels, bytes_per_image);
             stbi_image_free(pixels);
-            return NERF_STATUS_INTERNAL_ERROR;
         }
-        std::memcpy(host_images_rgba8.data() + image_index * bytes_per_image, pixels, bytes_per_image);
-        stbi_image_free(pixels);
-    }
 
-    const float width_f  = static_cast<float>(first_width);
-    const float height_f = static_cast<float>(first_height);
-    const float fx       = 0.5f * width_f / std::tan(camera_angle_x * 0.5f);
-    const float fy       = fx;
-    const float cx       = 0.5f * (width_f - 1.0f);
-    const float cy       = 0.5f * (height_f - 1.0f);
+        const float width_f  = static_cast<float>(first_width);
+        const float height_f = static_cast<float>(first_height);
+        const float fx       = 0.5f * width_f / std::tan(camera_angle_x * 0.5f);
+        const float fy       = fx;
+        const float cx       = 0.5f * (width_f - 1.0f);
+        const float cy       = 0.5f * (height_f - 1.0f);
 
-    float src_world_basis[9]{};
-    float src_camera_basis[9]{};
-    float dst_world_basis[9]{};
-    float dst_camera_basis[9]{};
-    status = fill_basis_matrix(src_world, src_world_basis);
-    if (status != NERF_STATUS_OK) return status;
-    status = fill_basis_matrix(src_camera, src_camera_basis);
-    if (status != NERF_STATUS_OK) return status;
-    status = fill_basis_matrix(dst_world, dst_world_basis);
-    if (status != NERF_STATUS_OK) return status;
-    status = fill_basis_matrix(dst_camera, dst_camera_basis);
-    if (status != NERF_STATUS_OK) return status;
+        float src_world_basis[9]{};
+        float src_camera_basis[9]{};
+        float dst_world_basis[9]{};
+        float dst_camera_basis[9]{};
+        fill_basis_matrix(src_world, src_world_basis);
+        fill_basis_matrix(src_camera, src_camera_basis);
+        fill_basis_matrix(dst_world, dst_world_basis);
+        fill_basis_matrix(dst_camera, dst_camera_basis);
 
-    float world_map[9]{};
-    float camera_map[9]{};
-    for (std::size_t r = 0u; r < 3u; ++r) {
-        for (std::size_t c = 0u; c < 3u; ++c) {
-            for (std::size_t k = 0u; k < 3u; ++k) {
-                world_map[r * 3u + c] += dst_world_basis[k * 3u + r] * src_world_basis[k * 3u + c];
-                camera_map[r * 3u + c] += src_camera_basis[k * 3u + r] * dst_camera_basis[k * 3u + c];
+        float world_map[9]{};
+        float camera_map[9]{};
+        for (std::size_t r = 0u; r < 3u; ++r) {
+            for (std::size_t c = 0u; c < 3u; ++c) {
+                for (std::size_t k = 0u; k < 3u; ++k) {
+                    world_map[r * 3u + c] += dst_world_basis[k * 3u + r] * src_world_basis[k * 3u + c];
+                    camera_map[r * 3u + c] += src_camera_basis[k * 3u + r] * dst_camera_basis[k * 3u + c];
+                }
             }
         }
-    }
 
-    std::vector<float> packed_cameras(frame_count * 16u, 0.0f);
-    for (std::size_t frame_index = 0u; frame_index < frame_count; ++frame_index) {
-        const float* row_major = row_major_4x4.data() + frame_index * 16u;
-        const float src_rot[9] = {
-            row_major[0],
-            row_major[1],
-            row_major[2],
-            row_major[4],
-            row_major[5],
-            row_major[6],
-            row_major[8],
-            row_major[9],
-            row_major[10],
+        std::vector<float> packed_cameras(frame_count * 16u, 0.0f);
+        for (std::size_t frame_index = 0u; frame_index < frame_count; ++frame_index) {
+            const float* row_major = row_major_4x4.data() + frame_index * 16u;
+            const float src_rot[9] = {
+                row_major[0],
+                row_major[1],
+                row_major[2],
+                row_major[4],
+                row_major[5],
+                row_major[6],
+                row_major[8],
+                row_major[9],
+                row_major[10],
+            };
+            const float src_translation[3] = {row_major[3], row_major[7], row_major[11]};
+
+            float tmp_rot[9]{};
+            float dst_rot[9]{};
+            float dst_translation[3]{};
+            for (std::size_t r = 0u; r < 3u; ++r) {
+                for (std::size_t c = 0u; c < 3u; ++c) {
+                    for (std::size_t k = 0u; k < 3u; ++k) tmp_rot[r * 3u + c] += world_map[r * 3u + k] * src_rot[k * 3u + c];
+                }
+            }
+            for (std::size_t r = 0u; r < 3u; ++r) {
+                for (std::size_t c = 0u; c < 3u; ++c) {
+                    for (std::size_t k = 0u; k < 3u; ++k) dst_rot[r * 3u + c] += tmp_rot[r * 3u + k] * camera_map[k * 3u + c];
+                }
+            }
+            for (std::size_t r = 0u; r < 3u; ++r) {
+                for (std::size_t k = 0u; k < 3u; ++k) dst_translation[r] += world_map[r * 3u + k] * src_translation[k];
+            }
+
+            float* packed = packed_cameras.data() + frame_index * 16u;
+            packed[0]     = dst_rot[0];
+            packed[1]     = dst_rot[1];
+            packed[2]     = dst_rot[2];
+            packed[3]     = dst_translation[0] * translation_scale + translation_bias_x;
+            packed[4]     = dst_rot[3];
+            packed[5]     = dst_rot[4];
+            packed[6]     = dst_rot[5];
+            packed[7]     = dst_translation[1] * translation_scale + translation_bias_y;
+            packed[8]     = dst_rot[6];
+            packed[9]     = dst_rot[7];
+            packed[10]    = dst_rot[8];
+            packed[11]    = dst_translation[2] * translation_scale + translation_bias_z;
+            packed[12]    = 0.0f;
+            packed[13]    = 0.0f;
+            packed[14]    = 0.0f;
+            packed[15]    = 1.0f;
+        }
+
+        out_data.images_rgba8       = std::move(host_images_rgba8);
+        out_data.cameras_4x4_packed = std::move(packed_cameras);
+        out_data.info               = HostDatasetData::Info{
+            .image_count  = static_cast<std::uint32_t>(frame_count),
+            .image_width  = static_cast<std::uint32_t>(first_width),
+            .image_height = static_cast<std::uint32_t>(first_height),
+            .fx           = fx,
+            .fy           = fy,
+            .cx           = cx,
+            .cy           = cy,
         };
-        const float src_translation[3] = {row_major[3], row_major[7], row_major[11]};
-
-        float tmp_rot[9]{};
-        float dst_rot[9]{};
-        float dst_translation[3]{};
-        for (std::size_t r = 0u; r < 3u; ++r) {
-            for (std::size_t c = 0u; c < 3u; ++c) {
-                for (std::size_t k = 0u; k < 3u; ++k) tmp_rot[r * 3u + c] += world_map[r * 3u + k] * src_rot[k * 3u + c];
-            }
-        }
-        for (std::size_t r = 0u; r < 3u; ++r) {
-            for (std::size_t c = 0u; c < 3u; ++c) {
-                for (std::size_t k = 0u; k < 3u; ++k) dst_rot[r * 3u + c] += tmp_rot[r * 3u + k] * camera_map[k * 3u + c];
-            }
-        }
-        for (std::size_t r = 0u; r < 3u; ++r) {
-            for (std::size_t k = 0u; k < 3u; ++k) dst_translation[r] += world_map[r * 3u + k] * src_translation[k];
-        }
-
-        float* packed = packed_cameras.data() + frame_index * 16u;
-        packed[0]     = dst_rot[0];
-        packed[1]     = dst_rot[1];
-        packed[2]     = dst_rot[2];
-        packed[3]     = dst_translation[0] * translation_scale + translation_bias_x;
-        packed[4]     = dst_rot[3];
-        packed[5]     = dst_rot[4];
-        packed[6]     = dst_rot[5];
-        packed[7]     = dst_translation[1] * translation_scale + translation_bias_y;
-        packed[8]     = dst_rot[6];
-        packed[9]     = dst_rot[7];
-        packed[10]    = dst_rot[8];
-        packed[11]    = dst_translation[2] * translation_scale + translation_bias_z;
-        packed[12]    = 0.0f;
-        packed[13]    = 0.0f;
-        packed[14]    = 0.0f;
-        packed[15]    = 1.0f;
+        return NERF_STATUS_OK;
+    } catch (...) {
+        return NERF_STATUS_FAILURE;
     }
-
-    out_data.images_rgba8       = std::move(host_images_rgba8);
-    out_data.cameras_4x4_packed = std::move(packed_cameras);
-    out_data.info               = HostDatasetData::Info{
-                      .image_count  = static_cast<std::uint32_t>(frame_count),
-                      .image_width  = static_cast<std::uint32_t>(first_width),
-                      .image_height = static_cast<std::uint32_t>(first_height),
-                      .fx           = fx,
-                      .fy           = fy,
-                      .cx           = cx,
-                      .cy           = cy,
-    };
-    return NERF_STATUS_OK;
 }
 
 int main(int argc, char** argv) {
@@ -422,37 +349,51 @@ int main(int argc, char** argv) {
         } else if (key == "--save-weights") {
             save_weights_path = value;
         } else if (key == "--steps") {
-            if (!parse_u32(value, steps)) {
+            try {
+                steps = static_cast<std::uint32_t>(std::stoul(std::string{value}));
+            } catch (...) {
                 std::cerr << "invalid value for --steps: " << value << '\n';
                 return 2;
             }
         } else if (key == "--rays") {
-            if (!parse_u32(value, rays_per_batch)) {
+            try {
+                rays_per_batch = static_cast<std::uint32_t>(std::stoul(std::string{value}));
+            } catch (...) {
                 std::cerr << "invalid value for --rays: " << value << '\n';
                 return 2;
             }
         } else if (key == "--max-sample-steps") {
-            if (!parse_u32(value, max_sample_steps)) {
+            try {
+                max_sample_steps = static_cast<std::uint32_t>(std::stoul(std::string{value}));
+            } catch (...) {
                 std::cerr << "invalid value for --max-sample-steps: " << value << '\n';
                 return 2;
             }
         } else if (key == "--log-interval") {
-            if (!parse_u32(value, log_interval)) {
+            try {
+                log_interval = static_cast<std::uint32_t>(std::stoul(std::string{value}));
+            } catch (...) {
                 std::cerr << "invalid value for --log-interval: " << value << '\n';
                 return 2;
             }
         } else if (key == "--inference-interval") {
-            if (!parse_u32(value, inference_interval)) {
+            try {
+                inference_interval = static_cast<std::uint32_t>(std::stoul(std::string{value}));
+            } catch (...) {
                 std::cerr << "invalid value for --inference-interval: " << value << '\n';
                 return 2;
             }
         } else if (key == "--inference-camera") {
-            if (!parse_u32(value, inference_camera)) {
+            try {
+                inference_camera = static_cast<std::uint32_t>(std::stoul(std::string{value}));
+            } catch (...) {
                 std::cerr << "invalid value for --inference-camera: " << value << '\n';
                 return 2;
             }
         } else if (key == "--inference-samples") {
-            if (!parse_u32(value, inference_samples)) {
+            try {
+                inference_samples = static_cast<std::uint32_t>(std::stoul(std::string{value}));
+            } catch (...) {
                 std::cerr << "invalid value for --inference-samples: " << value << '\n';
                 return 2;
             }
@@ -468,11 +409,6 @@ int main(int argc, char** argv) {
         std::cerr << "--dataset is required\n";
         return 2;
     }
-    if (steps == 0u || rays_per_batch == 0u || max_sample_steps == 0u || log_interval == 0u || inference_interval == 0u || inference_samples == 0u) {
-        std::cerr << "steps/rays/max-sample-steps/log-interval/inference-interval/inference-samples must be > 0\n";
-        return 2;
-    }
-
     void* context = nullptr;
     struct ContextGuard {
         void** context = nullptr;
@@ -506,11 +442,9 @@ int main(int argc, char** argv) {
         const std::string dataset_path_utf8 = dataset_path.string();
         NerfStatus status                   = load_nerf_synthetic_host_dataset(dataset_path_utf8.c_str(), host_data);
         if (status != NERF_STATUS_OK) throw std::runtime_error("load_nerf_synthetic_host_dataset failed: status=" + std::to_string(status));
-        if (inference_camera >= host_data.info.image_count) throw std::runtime_error("inference camera is out of range");
 
-        std::uint64_t inference_bytes = host_data.info.image_width;
-        if (!safe_mul_u64(inference_bytes, host_data.info.image_height, &inference_bytes)) throw std::runtime_error("inference image size overflow");
-        if (!safe_mul_u64(inference_bytes, 4u, &inference_bytes)) throw std::runtime_error("inference image size overflow");
+        const std::size_t inference_bytes =
+            static_cast<std::size_t>(host_data.info.image_width) * static_cast<std::size_t>(host_data.info.image_height) * 4u;
         std::vector<std::uint8_t> inference_rgba8(inference_bytes);
 
         NerfCreateDesc create_desc{
