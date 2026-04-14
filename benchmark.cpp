@@ -171,12 +171,12 @@ static NerfStatus load_nerf_synthetic_host_dataset(const char* path_utf8, HostDa
         std::vector<std::filesystem::path> image_paths(frame_count);
         std::vector<float> row_major_4x4(frame_count * 16u, 0.0f);
         for (std::size_t frame_index = 0u; frame_index < frame_count; ++frame_index) {
-            const nlohmann::json& frame = frames[frame_index];
+            const nlohmann::json& frame      = frames[frame_index];
             std::filesystem::path image_path = json_path.parent_path() / frame.at("file_path").get<std::string>();
             if (!image_path.has_extension()) image_path.replace_extension(".png");
             std::error_code ec{};
-            image_path = std::filesystem::absolute(image_path, ec);
-            image_path = std::filesystem::weakly_canonical(image_path, ec);
+            image_path               = std::filesystem::absolute(image_path, ec);
+            image_path               = std::filesystem::weakly_canonical(image_path, ec);
             image_paths[frame_index] = std::move(image_path);
 
             for (std::size_t r = 0u; r < 4u; ++r) {
@@ -288,13 +288,13 @@ static NerfStatus load_nerf_synthetic_host_dataset(const char* path_utf8, HostDa
         out_data.images_rgba8       = std::move(host_images_rgba8);
         out_data.cameras_4x4_packed = std::move(packed_cameras);
         out_data.info               = HostDatasetData::Info{
-            .image_count  = static_cast<std::uint32_t>(frame_count),
-            .image_width  = static_cast<std::uint32_t>(first_width),
-            .image_height = static_cast<std::uint32_t>(first_height),
-            .fx           = fx,
-            .fy           = fy,
-            .cx           = cx,
-            .cy           = cy,
+                          .image_count  = static_cast<std::uint32_t>(frame_count),
+                          .image_width  = static_cast<std::uint32_t>(first_width),
+                          .image_height = static_cast<std::uint32_t>(first_height),
+                          .fx           = fx,
+                          .fy           = fy,
+                          .cx           = cx,
+                          .cy           = cy,
         };
         return NERF_STATUS_OK;
     } catch (...) {
@@ -420,14 +420,14 @@ int main(int argc, char** argv) {
     } destroy_context_scope{.context = &context};
 
     const NerfHyperParams train_hp{
-        .learning_rate   = 5e-4f,
-        .adam_beta1      = 0.9f,
-        .adam_beta2      = 0.999f,
-        .adam_eps        = 1e-8f,
-        .grad_clip_norm  = 1.0f,
+        .learning_rate          = 5e-4f,
+        .adam_beta1             = 0.9f,
+        .adam_beta2             = 0.999f,
+        .adam_eps               = 1e-8f,
+        .grad_clip_norm         = 1.0f,
         .update_guard_grad_norm = 100.0f,
-        .loss_scale      = 128.0f,
-        .lr_decay_ksteps = 250u,
+        .loss_scale             = 128.0f,
+        .lr_decay_ksteps        = 250u,
     };
     const NerfOccupancyParams occupancy_hp{
         .decay            = 0.98f,
@@ -443,8 +443,7 @@ int main(int argc, char** argv) {
         NerfStatus status                   = load_nerf_synthetic_host_dataset(dataset_path_utf8.c_str(), host_data);
         if (status != NERF_STATUS_OK) throw std::runtime_error("load_nerf_synthetic_host_dataset failed: status=" + std::to_string(status));
 
-        const std::size_t inference_bytes =
-            static_cast<std::size_t>(host_data.info.image_width) * static_cast<std::size_t>(host_data.info.image_height) * 4u;
+        const std::size_t inference_bytes = static_cast<std::size_t>(host_data.info.image_width) * static_cast<std::size_t>(host_data.info.image_height) * 4u;
         std::vector<std::uint8_t> inference_rgba8(inference_bytes);
 
         NerfCreateDesc create_desc{

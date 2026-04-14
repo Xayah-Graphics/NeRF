@@ -26,14 +26,7 @@ extern "C" {
 #endif
 
 
-typedef enum NerfStatus {
-    NERF_STATUS_OK = 0,
-    NERF_STATUS_INVALID_USAGE = 1,
-    NERF_STATUS_STATE_ERROR = 2,
-    NERF_STATUS_IO_ERROR = 3,
-    NERF_STATUS_CUDA_ERROR = 4,
-    NERF_STATUS_FAILURE = 5
-} NerfStatus;
+typedef enum NerfStatus { NERF_STATUS_OK = 0, NERF_STATUS_INVALID_USAGE = 1, NERF_STATUS_STATE_ERROR = 2, NERF_STATUS_IO_ERROR = 3, NERF_STATUS_CUDA_ERROR = 4, NERF_STATUS_FAILURE = 5 } NerfStatus;
 
 typedef struct NerfCreateDesc {
     uint32_t occupancy_grid_res;
