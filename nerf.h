@@ -37,6 +37,11 @@ typedef struct NerfCreateDesc {
     const uint8_t* images_rgba8;
     uint64_t images_bytes;
 
+    // Row-major camera-to-world matrices packed as image_count consecutive 4x4 matrices:
+    // [ r00 r01 r02 tx
+    //   r10 r11 r12 ty
+    //   r20 r21 r22 tz
+    //   0   0   0   1 ]
     const float* cameras_4x4_packed;
     uint64_t cameras_bytes;
 

@@ -80,8 +80,6 @@ namespace nerf::host {
         uint32_t image_count;
         uint32_t image_width;
         uint32_t image_height;
-        uint64_t images_bytes;
-        uint64_t c2w_bytes;
         float fx;
         float fy;
         float cx;
@@ -125,7 +123,7 @@ namespace nerf::sampler {
     };
     struct SamplerRequest {
         cudaStream_t stream                    = nullptr;
-        const float4* cams                     = nullptr;
+        const float* cams_4x4_packed           = nullptr;
         const std::uint8_t* images             = nullptr;
         const std::uint32_t* bitfield          = nullptr;
         SampleRay* sample_rays                 = nullptr;
@@ -139,6 +137,10 @@ namespace nerf::sampler {
         std::uint32_t max_sample_step_count    = 0u;
         std::uint32_t image_width              = 0u;
         std::uint32_t image_height             = 0u;
+        float fx                               = 0.0f;
+        float fy                               = 0.0f;
+        float cx                               = 0.0f;
+        float cy                               = 0.0f;
         float3 aabb_min{};
         float3 aabb_max{};
     };
@@ -346,26 +348,24 @@ namespace nerf::sampler {
             return (bitfield[word] & 1u << bit) != 0u;
         }
         struct CameraParams {
-            float4 c0{};
-            float4 c1{};
-            float4 c2{};
-            float4 c3{};
+            float4 row0{};
+            float4 row1{};
+            float4 row2{};
             float fx = 0.0f;
             float fy = 0.0f;
             float cx = 0.0f;
             float cy = 0.0f;
         };
-        __device__ __forceinline__ CameraParams load_camera_params(const float4* cams, const std::uint32_t camera_idx) {
-            const std::uint32_t cam_base = camera_idx * 4u;
+        __device__ __forceinline__ CameraParams load_camera_params(const float* cams_4x4_packed, const std::uint32_t camera_idx, const float fx, const float fy, const float cx, const float cy) {
+            const std::uint32_t cam_base = camera_idx * 16u;
             CameraParams cam{};
-            cam.c0 = cams[cam_base + 0u];
-            cam.c1 = cams[cam_base + 1u];
-            cam.c2 = cams[cam_base + 2u];
-            cam.c3 = cams[cam_base + 3u];
-            cam.fx = cam.c0.w;
-            cam.fy = cam.c1.w;
-            cam.cx = cam.c2.w;
-            cam.cy = cam.c3.w;
+            cam.row0 = make_float4(cams_4x4_packed[cam_base + 0u], cams_4x4_packed[cam_base + 1u], cams_4x4_packed[cam_base + 2u], cams_4x4_packed[cam_base + 3u]);
+            cam.row1 = make_float4(cams_4x4_packed[cam_base + 4u], cams_4x4_packed[cam_base + 5u], cams_4x4_packed[cam_base + 6u], cams_4x4_packed[cam_base + 7u]);
+            cam.row2 = make_float4(cams_4x4_packed[cam_base + 8u], cams_4x4_packed[cam_base + 9u], cams_4x4_packed[cam_base + 10u], cams_4x4_packed[cam_base + 11u]);
+            cam.fx   = fx;
+            cam.fy   = fy;
+            cam.cx   = cx;
+            cam.cy   = cy;
             return cam;
         }
         __device__ __forceinline__ bool compute_world_ray_dir(const CameraParams& cam, const float pixel_x, const float pixel_y_flipped, float3* out_ray_dir) {
@@ -374,9 +374,9 @@ namespace nerf::sampler {
             dir_cam.y = (pixel_y_flipped - cam.cy) / cam.fy;
             dir_cam.z = -1.0f;
             float3 ray_dir{};
-            ray_dir.x        = cam.c0.x * dir_cam.x + cam.c1.x * dir_cam.y + cam.c2.x * dir_cam.z;
-            ray_dir.y        = cam.c0.y * dir_cam.x + cam.c1.y * dir_cam.y + cam.c2.y * dir_cam.z;
-            ray_dir.z        = cam.c0.z * dir_cam.x + cam.c1.z * dir_cam.y + cam.c2.z * dir_cam.z;
+            ray_dir.x        = cam.row0.x * dir_cam.x + cam.row0.y * dir_cam.y + cam.row0.z * dir_cam.z;
+            ray_dir.y        = cam.row1.x * dir_cam.x + cam.row1.y * dir_cam.y + cam.row1.z * dir_cam.z;
+            ray_dir.z        = cam.row2.x * dir_cam.x + cam.row2.y * dir_cam.y + cam.row2.z * dir_cam.z;
             const float len2 = ray_dir.x * ray_dir.x + ray_dir.y * ray_dir.y + ray_dir.z * ray_dir.z;
             if (len2 <= 1e-16f) return false;
             const float inv_len = rsqrtf(len2);
@@ -417,8 +417,8 @@ namespace nerf::sampler {
             batch_state->active_ray_count  = 0u;
             batch_state->sample_step_count = 0u;
         }
-        __global__ void k_sample_rays_flat(const std::uint32_t frame_index, const std::uint32_t camera_idx, const float4* __restrict__ cams, const std::uint8_t* __restrict__ images, const std::uint32_t image_width, const std::uint32_t image_height, const std::uint32_t rays_per_batch, const std::uint32_t max_sample_steps_per_ray, const std::uint32_t max_sample_step_count, const float3 aabb_min, const float3 aabb_max, const std::uint32_t* __restrict__ bitfield,
-            const std::uint32_t grid_res, SampleRay* __restrict__ sample_rays, SampleStep* __restrict__ sample_steps, SampleBatchState* __restrict__ batch_state) {
+        __global__ void k_sample_rays_flat(const std::uint32_t frame_index, const std::uint32_t camera_idx, const float* __restrict__ cams_4x4_packed, const std::uint8_t* __restrict__ images, const std::uint32_t image_width, const std::uint32_t image_height, const float fx, const float fy, const float cx, const float cy, const std::uint32_t rays_per_batch, const std::uint32_t max_sample_steps_per_ray, const std::uint32_t max_sample_step_count, const float3 aabb_min,
+            const float3 aabb_max, const std::uint32_t* __restrict__ bitfield, const std::uint32_t grid_res, SampleRay* __restrict__ sample_rays, SampleStep* __restrict__ sample_steps, SampleBatchState* __restrict__ batch_state) {
             const std::uint32_t ray_idx = blockIdx.x * blockDim.x + threadIdx.x;
             if (ray_idx >= rays_per_batch) return;
             __shared__ CameraParams shared_cam;
@@ -427,7 +427,7 @@ namespace nerf::sampler {
             const std::uint64_t per_cam_bytes = static_cast<std::uint64_t>(image_width) * static_cast<std::uint64_t>(image_height) * 4ull;
             if (threadIdx.x == 0u) {
                 shared_camera_idx   = camera_idx;
-                shared_cam          = load_camera_params(cams, shared_camera_idx);
+                shared_cam          = load_camera_params(cams_4x4_packed, shared_camera_idx, fx, fy, cx, cy);
                 shared_camera_image = images + static_cast<std::uint64_t>(shared_camera_idx) * per_cam_bytes;
             }
             __syncthreads();
@@ -435,7 +435,7 @@ namespace nerf::sampler {
             const float pixel_x         = rand01(seed ^ 0xA511E9B3u) * static_cast<float>(image_width);
             const float pixel_y         = rand01(seed ^ 0x63D83595u) * static_cast<float>(image_height);
             const float pixel_y_flipped = static_cast<float>(image_height) - 1.0f - pixel_y;
-            const float3 ray_origin     = make_float3(shared_cam.c3.x, shared_cam.c3.y, shared_cam.c3.z);
+            const float3 ray_origin     = make_float3(shared_cam.row0.w, shared_cam.row1.w, shared_cam.row2.w);
             float3 ray_dir{};
             float t_near = 0.0f;
             float t_far  = 0.0f;
@@ -527,12 +527,12 @@ namespace nerf::sampler {
             sample_ray.sample_count  = sample_count;
             sample_rays[active_slot] = sample_ray;
         }
-        __global__ void k_generate_inference_inputs(const float4* __restrict__ cams, const std::uint32_t camera_idx, const std::uint32_t image_width, const std::uint32_t image_height, const std::uint32_t ray_start, const std::uint32_t ray_count, const std::uint32_t samples_per_ray, const float3 aabb_min, const float3 aabb_max, float* __restrict__ out_inputs, std::uint32_t* __restrict__ out_ray_counts) {
+        __global__ void k_generate_inference_inputs(const float* __restrict__ cams_4x4_packed, const std::uint32_t camera_idx, const std::uint32_t image_width, const std::uint32_t image_height, const float fx, const float fy, const float cx, const float cy, const std::uint32_t ray_start, const std::uint32_t ray_count, const std::uint32_t samples_per_ray, const float3 aabb_min, const float3 aabb_max, float* __restrict__ out_inputs, std::uint32_t* __restrict__ out_ray_counts) {
             const std::uint32_t local_ray = blockIdx.x * blockDim.x + threadIdx.x;
             if (local_ray >= ray_count) return;
 
             __shared__ CameraParams shared_cam;
-            if (threadIdx.x == 0u) shared_cam = load_camera_params(cams, camera_idx);
+            if (threadIdx.x == 0u) shared_cam = load_camera_params(cams_4x4_packed, camera_idx, fx, fy, cx, cy);
             __syncthreads();
 
             const std::uint32_t global_ray = ray_start + local_ray;
@@ -558,7 +558,7 @@ namespace nerf::sampler {
             const float pixel_y         = static_cast<float>(py) + 0.5f;
             const float pixel_y_flipped = static_cast<float>(image_height) - 1.0f - pixel_y;
 
-            const float3 ray_origin = make_float3(shared_cam.c3.x, shared_cam.c3.y, shared_cam.c3.z);
+            const float3 ray_origin = make_float3(shared_cam.row0.w, shared_cam.row1.w, shared_cam.row2.w);
             float3 ray_dir{};
             float t_near        = 0.0f;
             float t_far         = 0.0f;
@@ -631,20 +631,21 @@ namespace nerf::sampler {
         }
     } // namespace
     bool run_sampler(const SamplerRequest& request) {
-        if (!request.stream || !request.cams || !request.images || !request.bitfield) return false;
+        if (!request.stream || !request.cams_4x4_packed || !request.images || !request.bitfield) return false;
         if (!request.sample_rays || !request.sample_steps || !request.batch_state) return false;
         if (request.rays_per_batch == 0u || request.max_sample_steps_per_ray == 0u || request.max_sample_step_count == 0u) return false;
         k_begin_sampling_step<<<1, 1, 0, request.stream>>>(request.batch_state);
         if (const cudaError_t e = cudaGetLastError(); e != cudaSuccess) return false;
         const std::uint32_t blocks = (request.rays_per_batch + kSamplerBlockRays - 1u) / kSamplerBlockRays;
-        k_sample_rays_flat<<<blocks, kSamplerBlockRays, 0, request.stream>>>(request.frame_index, request.camera_idx, request.cams, request.images, request.image_width, request.image_height, request.rays_per_batch, request.max_sample_steps_per_ray, request.max_sample_step_count, request.aabb_min, request.aabb_max, request.bitfield, request.occupancy_grid_res, request.sample_rays, request.sample_steps, request.batch_state);
+        k_sample_rays_flat<<<blocks, kSamplerBlockRays, 0, request.stream>>>(
+            request.frame_index, request.camera_idx, request.cams_4x4_packed, request.images, request.image_width, request.image_height, request.fx, request.fy, request.cx, request.cy, request.rays_per_batch, request.max_sample_steps_per_ray, request.max_sample_step_count, request.aabb_min, request.aabb_max, request.bitfield, request.occupancy_grid_res, request.sample_rays, request.sample_steps, request.batch_state);
         return cudaGetLastError() == cudaSuccess;
     }
-    bool write_inference_inputs(cudaStream_t stream, const float4* cams, const std::uint32_t camera_idx, const std::uint32_t image_width, const std::uint32_t image_height, const std::uint32_t ray_start, const std::uint32_t ray_count, const std::uint32_t samples_per_ray, const float3 aabb_min, const float3 aabb_max, float* out_inputs, std::uint32_t* out_ray_counts) {
+    bool write_inference_inputs(cudaStream_t stream, const float* cams_4x4_packed, const std::uint32_t camera_idx, const std::uint32_t image_width, const std::uint32_t image_height, const float fx, const float fy, const float cx, const float cy, const std::uint32_t ray_start, const std::uint32_t ray_count, const std::uint32_t samples_per_ray, const float3 aabb_min, const float3 aabb_max, float* out_inputs, std::uint32_t* out_ray_counts) {
         if (ray_count == 0u) return true;
         constexpr std::uint32_t inference_threads = 256u;
         const std::uint32_t inference_blocks      = (ray_count + inference_threads - 1u) / inference_threads;
-        k_generate_inference_inputs<<<inference_blocks, inference_threads, 0, stream>>>(cams, camera_idx, image_width, image_height, ray_start, ray_count, samples_per_ray, aabb_min, aabb_max, out_inputs, out_ray_counts);
+        k_generate_inference_inputs<<<inference_blocks, inference_threads, 0, stream>>>(cams_4x4_packed, camera_idx, image_width, image_height, fx, fy, cx, cy, ray_start, ray_count, samples_per_ray, aabb_min, aabb_max, out_inputs, out_ray_counts);
         return cudaGetLastError() == cudaSuccess;
     }
     bool write_inference_rgba(cudaStream_t stream, const float* raw_rgb, const float* raw_sigma, const float* inputs, const std::uint32_t* ray_counts, const std::uint32_t ray_start, const std::uint32_t ray_count, const std::uint32_t samples_per_ray, const std::uint32_t image_width, const std::uint32_t image_height, std::uint32_t* out_rgba) {
@@ -1360,19 +1361,17 @@ namespace nerf::runtime {
         std::uint32_t lr_decay_ksteps;
     };
     struct OccupancyUpdateRequest {
-        const TrainingDeviceState* device_state = nullptr;
-        std::uint32_t* bitfield                 = nullptr;
-        std::uint64_t bitfield_bytes            = 0u;
-        float* density_grid                     = nullptr;
-        std::uint32_t grid_res                  = 0u;
-        std::uint32_t cell_count                = 0u;
-        std::uint32_t update_count              = 0u;
-        std::uint32_t update_rows_padded        = 0u;
-        float decay                             = 0.98f;
-        float threshold                         = 0.01f;
-        std::uint32_t cells_per_update          = 65536u;
-        std::uint32_t update_interval           = 1u;
-        std::uint32_t warmup_steps              = 32u;
+        std::uint32_t* bitfield          = nullptr;
+        std::uint64_t bitfield_bytes     = 0u;
+        float* density_grid              = nullptr;
+        std::uint32_t grid_res           = 0u;
+        std::uint32_t cell_count         = 0u;
+        std::uint32_t update_count       = 0u;
+        std::uint32_t update_rows_padded = 0u;
+        float decay                      = 0.98f;
+        float threshold                  = 0.01f;
+        std::uint32_t update_interval    = 1u;
+        std::uint32_t warmup_steps       = 32u;
         float3 aabb_min{};
         float3 aabb_max{};
     };
@@ -1823,7 +1822,6 @@ namespace nerf::runtime {
         const std::uint64_t total_rays64 = static_cast<std::uint64_t>(image_width) * static_cast<std::uint64_t>(image_height);
         if (total_rays64 > static_cast<std::uint64_t>(std::numeric_limits<std::uint32_t>::max())) return false;
         const std::uint32_t total_rays = static_cast<std::uint32_t>(total_rays64);
-        if (total_rays == 0u) return true;
 
         const std::uint32_t max_chunk_rays = runtime.workspace.rows_capacity / samples_per_ray;
         if (max_chunk_rays == 0u) return false;
@@ -1835,11 +1833,11 @@ namespace nerf::runtime {
             aabb_max = make_float3(runtime.training_config.aabb_max_x, runtime.training_config.aabb_max_y, runtime.training_config.aabb_max_z);
         }
 
-        const auto* cams = reinterpret_cast<const float4*>(ctx.xforms.ptr);
+        const auto* cams_4x4_packed = reinterpret_cast<const float*>(ctx.xforms.ptr);
         for (std::uint32_t ray_start = 0u; ray_start < total_rays; ray_start += max_chunk_rays) {
             const std::uint32_t ray_count = std::min(max_chunk_rays, total_rays - ray_start);
             const std::uint32_t rows      = ray_count * samples_per_ray;
-            if (!nerf::sampler::write_inference_inputs(runtime.stream, cams, camera_idx, image_width, image_height, ray_start, ray_count, samples_per_ray, aabb_min, aabb_max, runtime.workspace.inputs_tmp, runtime.workspace.ray_counts_tmp)) return false;
+            if (!nerf::sampler::write_inference_inputs(runtime.stream, cams_4x4_packed, camera_idx, image_width, image_height, ctx.dataset_info.fx, ctx.dataset_info.fy, ctx.dataset_info.cx, ctx.dataset_info.cy, ray_start, ray_count, samples_per_ray, aabb_min, aabb_max, runtime.workspace.inputs_tmp, runtime.workspace.ray_counts_tmp)) return false;
             if (!nerf::encoder::run_encoder_module(runtime.stream, runtime.workspace.inputs_tmp, rows, runtime.workspace.enc_pts, runtime.workspace.enc_dir)) return false;
             if (!nerf::network::run_network_inference(runtime.network, runtime.workspace, runtime.stream,
                     nerf::network::NetworkInferenceRequest{
@@ -1857,7 +1855,7 @@ namespace nerf::runtime {
 } // namespace nerf::runtime
 
 
-static NerfStatus upload_dataset_from_create_desc(nerf::runtime::ContextStorage* ctx, const NerfCreateDesc& desc, nerf::host::DatasetInfo* out_info) {
+static NerfStatus upload_dataset_from_create_desc(nerf::runtime::ContextStorage* ctx, const NerfCreateDesc& desc) {
     if (!ctx) return NERF_STATUS_INVALID_ARGUMENT;
     if (!desc.images_rgba8) return NERF_STATUS_INVALID_ARGUMENT;
     if (!desc.cameras_4x4_packed) return NERF_STATUS_INVALID_ARGUMENT;
@@ -1973,13 +1971,10 @@ static NerfStatus upload_dataset_from_create_desc(nerf::runtime::ContextStorage*
     ctx->dataset_info.image_count  = desc.image_count;
     ctx->dataset_info.image_width  = desc.image_width;
     ctx->dataset_info.image_height = desc.image_height;
-    ctx->dataset_info.images_bytes = desc.images_bytes;
-    ctx->dataset_info.c2w_bytes    = desc.cameras_bytes;
     ctx->dataset_info.fx           = desc.fx;
     ctx->dataset_info.fy           = desc.fy;
     ctx->dataset_info.cx           = desc.cx;
     ctx->dataset_info.cy           = desc.cy;
-    if (out_info) *out_info = ctx->dataset_info;
     return NERF_STATUS_OK;
 }
 
@@ -2097,7 +2092,7 @@ NerfStatus nerf_create_context(const NerfCreateDesc* desc, void** out_context) {
         std::scoped_lock lock(context->cuda_context->train_runtime_mutex);
         context->cuda_context->train_runtime = std::move(runtime);
     }
-    const NerfStatus upload_status = upload_dataset_from_create_desc(context.get(), normalized, &context->dataset_info);
+    const NerfStatus upload_status = upload_dataset_from_create_desc(context.get(), normalized);
     if (upload_status != NERF_STATUS_OK) {
         std::shared_ptr<nerf::runtime::TrainRuntime> runtime;
         {
@@ -2173,7 +2168,6 @@ NerfStatus nerf_configure_training(void* context, const NerfTrainingConfig* conf
     const std::uint32_t occupancy_update_count       = std::min<std::uint32_t>(normalized.occupancy_params.cells_per_update, occupancy_cell_count);
     const std::uint32_t occupancy_update_rows_padded = (occupancy_update_count + kNetworkBatchGranularity - 1u) / kNetworkBatchGranularity * kNetworkBatchGranularity;
     const nerf::runtime::OccupancyUpdateRequest occupancy_request{
-        .device_state       = runtime->device_state,
         .bitfield           = reinterpret_cast<std::uint32_t*>(ctx->occupancy_bitfield.ptr),
         .bitfield_bytes     = ctx->occupancy_bitfield.size_bytes,
         .density_grid       = reinterpret_cast<float*>(ctx->occupancy_density.ptr),
@@ -2183,7 +2177,6 @@ NerfStatus nerf_configure_training(void* context, const NerfTrainingConfig* conf
         .update_rows_padded = occupancy_update_rows_padded,
         .decay              = normalized.occupancy_params.decay,
         .threshold          = normalized.occupancy_params.threshold,
-        .cells_per_update   = normalized.occupancy_params.cells_per_update,
         .update_interval    = normalized.occupancy_params.update_interval,
         .warmup_steps       = normalized.occupancy_params.warmup_steps,
         .aabb_min           = float3{normalized.aabb_min_x, normalized.aabb_min_y, normalized.aabb_min_z},
@@ -2191,7 +2184,7 @@ NerfStatus nerf_configure_training(void* context, const NerfTrainingConfig* conf
     };
     const nerf::sampler::SamplerRequest sampler_request{
         .stream                   = runtime->stream,
-        .cams                     = reinterpret_cast<const float4*>(ctx->xforms.ptr),
+        .cams_4x4_packed          = reinterpret_cast<const float*>(ctx->xforms.ptr),
         .images                   = reinterpret_cast<const std::uint8_t*>(ctx->images.ptr),
         .bitfield                 = reinterpret_cast<const std::uint32_t*>(ctx->occupancy_bitfield.ptr),
         .sample_rays              = reinterpret_cast<nerf::sampler::SampleRay*>(ctx->sample_rays.ptr),
@@ -2203,6 +2196,10 @@ NerfStatus nerf_configure_training(void* context, const NerfTrainingConfig* conf
         .max_sample_step_count    = static_cast<std::uint32_t>(total_sample_steps),
         .image_width              = ctx->dataset_info.image_width,
         .image_height             = ctx->dataset_info.image_height,
+        .fx                       = ctx->dataset_info.fx,
+        .fy                       = ctx->dataset_info.fy,
+        .cx                       = ctx->dataset_info.cx,
+        .cy                       = ctx->dataset_info.cy,
         .aabb_min                 = float3{normalized.aabb_min_x, normalized.aabb_min_y, normalized.aabb_min_z},
         .aabb_max                 = float3{normalized.aabb_max_x, normalized.aabb_max_y, normalized.aabb_max_z},
     };
@@ -2223,22 +2220,15 @@ NerfStatus nerf_configure_training(void* context, const NerfTrainingConfig* conf
     };
     {
         std::scoped_lock run_lock(runtime->run_mutex);
-        const bool same_plan = runtime->training_configured && runtime->training_request.max_sample_step_count == training_request.max_sample_step_count && runtime->occupancy_request.update_rows_padded == occupancy_request.update_rows_padded && runtime->training_config.aabb_min_x == normalized.aabb_min_x && runtime->training_config.aabb_min_y == normalized.aabb_min_y && runtime->training_config.aabb_min_z == normalized.aabb_min_z
-                            && runtime->training_config.aabb_max_x == normalized.aabb_max_x && runtime->training_config.aabb_max_y == normalized.aabb_max_y && runtime->training_config.aabb_max_z == normalized.aabb_max_z && runtime->training_config.hyper_params.learning_rate == normalized.hyper_params.learning_rate && runtime->training_config.hyper_params.adam_beta1 == normalized.hyper_params.adam_beta1
-                            && runtime->training_config.hyper_params.adam_beta2 == normalized.hyper_params.adam_beta2 && runtime->training_config.hyper_params.adam_eps == normalized.hyper_params.adam_eps && runtime->training_config.hyper_params.lr_decay_ksteps == normalized.hyper_params.lr_decay_ksteps && runtime->training_config.occupancy_params.decay == normalized.occupancy_params.decay
-                            && runtime->training_config.occupancy_params.threshold == normalized.occupancy_params.threshold && runtime->training_config.occupancy_params.cells_per_update == normalized.occupancy_params.cells_per_update && runtime->training_config.occupancy_params.update_interval == normalized.occupancy_params.update_interval && runtime->training_config.occupancy_params.warmup_steps == normalized.occupancy_params.warmup_steps
-                            && runtime->training_config.rays_per_batch == normalized.rays_per_batch && runtime->training_config.max_sample_steps_per_ray == normalized.max_sample_steps_per_ray;
-        if (!same_plan) {
-            if (cudaStreamSynchronize(runtime->stream) != cudaSuccess) return NERF_STATUS_INTERNAL_ERROR;
-            const std::uint32_t occupancy_rows = occupancy_request.update_rows_padded;
-            const std::uint32_t workspace_rows = std::max(training_request.max_sample_step_count + kNetworkBatchGranularity, occupancy_rows);
-            if (!nerf::runtime::alloc_workspace(runtime->workspace, workspace_rows)) return NERF_STATUS_INTERNAL_ERROR;
-            runtime->training_config     = normalized;
-            runtime->occupancy_request   = occupancy_request;
-            runtime->sampler_request     = sampler_request;
-            runtime->training_request    = training_request;
-            runtime->training_configured = true;
-        }
+        if (cudaStreamSynchronize(runtime->stream) != cudaSuccess) return NERF_STATUS_INTERNAL_ERROR;
+        const std::uint32_t occupancy_rows = occupancy_request.update_rows_padded;
+        const std::uint32_t workspace_rows = std::max(training_request.max_sample_step_count + kNetworkBatchGranularity, occupancy_rows);
+        if (!nerf::runtime::alloc_workspace(runtime->workspace, workspace_rows)) return NERF_STATUS_INTERNAL_ERROR;
+        runtime->training_config     = normalized;
+        runtime->occupancy_request   = occupancy_request;
+        runtime->sampler_request     = sampler_request;
+        runtime->training_request    = training_request;
+        runtime->training_configured = true;
     }
     return NERF_STATUS_OK;
 }
@@ -2356,8 +2346,7 @@ NerfStatus nerf_inference(void* context, const NerfInferenceRequest* request, Ne
     if (request->dst_rgba8 == nullptr && request->dst_bytes != 0u) return NERF_STATUS_INVALID_ARGUMENT;
     if (request->dst_rgba8 != nullptr && request->memory_kind != NERF_MEMORY_HOST && request->memory_kind != NERF_MEMORY_CUDA_DEVICE) return NERF_STATUS_INVALID_ARGUMENT;
     const std::uint32_t samples_per_ray = request->samples_per_ray == 0u ? kDefaultInferenceSamplesPerRay : request->samples_per_ray;
-    if (samples_per_ray == 0u) return NERF_STATUS_INVALID_ARGUMENT;
-    std::uint64_t expected_bytes = static_cast<std::uint64_t>(ctx->dataset_info.image_width);
+    std::uint64_t expected_bytes        = static_cast<std::uint64_t>(ctx->dataset_info.image_width);
     if (expected_bytes > std::numeric_limits<std::uint64_t>::max() / 4u) return NERF_STATUS_OVERFLOW;
     expected_bytes *= 4u;
     if (expected_bytes > std::numeric_limits<std::uint64_t>::max() / static_cast<std::uint64_t>(ctx->dataset_info.image_height)) return NERF_STATUS_OVERFLOW;

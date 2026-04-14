@@ -25,7 +25,6 @@ struct HostDatasetData {
         uint32_t image_count;
         uint32_t image_width;
         uint32_t image_height;
-        uint64_t images_bytes;
         float fx;
         float fy;
         float cx;
@@ -353,21 +352,21 @@ static NerfStatus load_nerf_synthetic_host_dataset(const char* path_utf8, HostDa
 
         float* packed = packed_cameras.data() + frame_index * 16u;
         packed[0]     = dst_rot[0];
-        packed[1]     = dst_rot[3];
-        packed[2]     = dst_rot[6];
-        packed[3]     = fx;
-        packed[4]     = dst_rot[1];
+        packed[1]     = dst_rot[1];
+        packed[2]     = dst_rot[2];
+        packed[3]     = dst_translation[0] * kScale + kOffX;
+        packed[4]     = dst_rot[3];
         packed[5]     = dst_rot[4];
-        packed[6]     = dst_rot[7];
-        packed[7]     = fy;
-        packed[8]     = dst_rot[2];
-        packed[9]     = dst_rot[5];
+        packed[6]     = dst_rot[5];
+        packed[7]     = dst_translation[1] * kScale + kOffY;
+        packed[8]     = dst_rot[6];
+        packed[9]     = dst_rot[7];
         packed[10]    = dst_rot[8];
-        packed[11]    = cx;
-        packed[12]    = dst_translation[0] * kScale + kOffX;
-        packed[13]    = dst_translation[1] * kScale + kOffY;
-        packed[14]    = dst_translation[2] * kScale + kOffZ;
-        packed[15]    = cy;
+        packed[11]    = dst_translation[2] * kScale + kOffZ;
+        packed[12]    = 0.0f;
+        packed[13]    = 0.0f;
+        packed[14]    = 0.0f;
+        packed[15]    = 1.0f;
     }
 
     out_data.images_rgba8       = std::move(host_images_rgba8);
@@ -376,7 +375,6 @@ static NerfStatus load_nerf_synthetic_host_dataset(const char* path_utf8, HostDa
                       .image_count  = static_cast<std::uint32_t>(frame_count),
                       .image_width  = static_cast<std::uint32_t>(first_width),
                       .image_height = static_cast<std::uint32_t>(first_height),
-                      .images_bytes = total_image_bytes,
                       .fx           = fx,
                       .fy           = fy,
                       .cx           = cx,
