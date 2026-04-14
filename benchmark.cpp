@@ -10,14 +10,6 @@
 
 import std;
 
-constexpr std::uint32_t kDefaultSteps             = 10000u;
-constexpr std::uint32_t kDefaultRays              = 4096u;
-constexpr std::uint32_t kDefaultMaxSampleSteps    = 64u;
-constexpr std::uint32_t kDefaultLogInterval       = 200u;
-constexpr std::uint32_t kDefaultInferenceInterval = 2000u;
-constexpr std::uint32_t kDefaultInferenceCamera   = 0u;
-constexpr std::uint32_t kDefaultInferenceSamples  = 64u;
-
 struct HostDatasetData {
     std::vector<std::uint8_t> images_rgba8;
     std::vector<float> cameras_4x4_packed;
@@ -72,7 +64,7 @@ static InferenceMetrics evaluate_inference_rgba8(const HostDatasetData& dataset,
     const std::uint32_t image_height = dataset.info.image_height;
     const std::size_t image_stride   = static_cast<std::size_t>(image_width) * static_cast<std::size_t>(image_height) * 4u;
     const std::size_t camera_base    = static_cast<std::size_t>(camera_idx) * image_stride;
-    constexpr float inv255           = 1.0f / 255.0f;
+    const float inv255               = 1.0f / 255.0f;
     double mse                       = 0.0;
     double luma_sum                  = 0.0;
 
@@ -175,14 +167,14 @@ static NerfStatus fill_basis_matrix(const CoordBasis& basis, float out_matrix[9]
 }
 
 static NerfStatus load_nerf_synthetic_host_dataset(const char* path_utf8, HostDatasetData& out_data) {
-    constexpr CoordBasis src_world{.x = CoordAxis::PosX, .y = CoordAxis::NegZ, .z = CoordAxis::PosY};
-    constexpr CoordBasis src_camera{.x = CoordAxis::PosX, .y = CoordAxis::PosY, .z = CoordAxis::PosZ};
-    constexpr CoordBasis dst_world{.x = CoordAxis::PosX, .y = CoordAxis::PosY, .z = CoordAxis::PosZ};
-    constexpr CoordBasis dst_camera{.x = CoordAxis::PosX, .y = CoordAxis::PosY, .z = CoordAxis::PosZ};
-    constexpr float kScale = 0.33f;
-    constexpr float kOffX  = 0.5f;
-    constexpr float kOffY  = 0.5f;
-    constexpr float kOffZ  = 0.5f;
+    const CoordBasis src_world{.x = CoordAxis::PosX, .y = CoordAxis::NegZ, .z = CoordAxis::PosY};
+    const CoordBasis src_camera{.x = CoordAxis::PosX, .y = CoordAxis::PosY, .z = CoordAxis::PosZ};
+    const CoordBasis dst_world{.x = CoordAxis::PosX, .y = CoordAxis::PosY, .z = CoordAxis::PosZ};
+    const CoordBasis dst_camera{.x = CoordAxis::PosX, .y = CoordAxis::PosY, .z = CoordAxis::PosZ};
+    const float translation_scale = 0.33f;
+    const float translation_bias_x = 0.5f;
+    const float translation_bias_y = 0.5f;
+    const float translation_bias_z = 0.5f;
 
     std::filesystem::path json_path{};
     NerfStatus status = resolve_dataset_json_path(path_utf8, json_path);
@@ -354,15 +346,15 @@ static NerfStatus load_nerf_synthetic_host_dataset(const char* path_utf8, HostDa
         packed[0]     = dst_rot[0];
         packed[1]     = dst_rot[1];
         packed[2]     = dst_rot[2];
-        packed[3]     = dst_translation[0] * kScale + kOffX;
+        packed[3]     = dst_translation[0] * translation_scale + translation_bias_x;
         packed[4]     = dst_rot[3];
         packed[5]     = dst_rot[4];
         packed[6]     = dst_rot[5];
-        packed[7]     = dst_translation[1] * kScale + kOffY;
+        packed[7]     = dst_translation[1] * translation_scale + translation_bias_y;
         packed[8]     = dst_rot[6];
         packed[9]     = dst_rot[7];
         packed[10]    = dst_rot[8];
-        packed[11]    = dst_translation[2] * kScale + kOffZ;
+        packed[11]    = dst_translation[2] * translation_scale + translation_bias_z;
         packed[12]    = 0.0f;
         packed[13]    = 0.0f;
         packed[14]    = 0.0f;
@@ -388,13 +380,13 @@ int main(int argc, char** argv) {
     std::filesystem::path load_weights_path{};
     std::filesystem::path save_weights_path{};
     std::filesystem::path inference_out_path{"nerf_inference_final.png"};
-    std::uint32_t steps              = kDefaultSteps;
-    std::uint32_t rays_per_batch     = kDefaultRays;
-    std::uint32_t max_sample_steps   = kDefaultMaxSampleSteps;
-    std::uint32_t log_interval       = kDefaultLogInterval;
-    std::uint32_t inference_interval = kDefaultInferenceInterval;
-    std::uint32_t inference_camera   = kDefaultInferenceCamera;
-    std::uint32_t inference_samples  = kDefaultInferenceSamples;
+    std::uint32_t steps              = 10000u;
+    std::uint32_t rays_per_batch     = 4096u;
+    std::uint32_t max_sample_steps   = 64u;
+    std::uint32_t log_interval       = 200u;
+    std::uint32_t inference_interval = 2000u;
+    std::uint32_t inference_camera   = 0u;
+    std::uint32_t inference_samples  = 64u;
 
     auto print_help = [&]() {
         const std::string exe_name = (argc > 0 && argv[0]) ? std::filesystem::path(argv[0]).filename().string() : std::string{"benchmark"};
@@ -491,14 +483,17 @@ int main(int argc, char** argv) {
         }
     } destroy_context_scope{.context = &context};
 
-    constexpr NerfHyperParams train_hp{
+    const NerfHyperParams train_hp{
         .learning_rate   = 5e-4f,
         .adam_beta1      = 0.9f,
         .adam_beta2      = 0.999f,
         .adam_eps        = 1e-8f,
+        .grad_clip_norm  = 1.0f,
+        .update_guard_grad_norm = 100.0f,
+        .loss_scale      = 128.0f,
         .lr_decay_ksteps = 250u,
     };
-    constexpr NerfOccupancyParams occupancy_hp{
+    const NerfOccupancyParams occupancy_hp{
         .decay            = 0.98f,
         .threshold        = 0.01f,
         .cells_per_update = 65536u,

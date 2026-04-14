@@ -62,6 +62,9 @@ typedef struct NerfHyperParams {
     float adam_beta1;
     float adam_beta2;
     float adam_eps;
+    float grad_clip_norm;
+    float update_guard_grad_norm;
+    float loss_scale;
     uint32_t lr_decay_ksteps;
 } NerfHyperParams;
 typedef struct NerfOccupancyParams {
